@@ -37,3 +37,6 @@ ai-teacher/
 # OS
 .DS_Store
 Thumbs.db
+
+.build_order.txt
+.commands.txt
