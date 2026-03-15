@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+
+# environments
+.env
+venv/
+.venv/
+env/
+whisper-env/
+ai-teacher/
+
+# database
+*.db
+*.sqlite
+
+# logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# model files
+*.bin
+*.gguf
+*.pt
+*.pth
+
+# cache
+.cache/
+
+# audio files
+*.wav
+*.mp3
+
+# OS
+.DS_Store
+Thumbs.db

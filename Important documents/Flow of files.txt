@@ -1,0 +1,5 @@
+Started with llm_service.py, main.py and terminal_chat.py for terminal chat with LLM with teacher prompt rules within 180-200 tokens inside llm_service.py. 
+
+Extended the functionality so that last 12 messages are saved on redis with a fallback of entire conversation being saved to sqlite and recent 4 messages passed to llm for context either from redis or SQLite(fallback) with the introduction of chat_memory.py.
+
+Extended the functionality so that a (summary of all - summary of recent 4 messages + recent 4 messages as it is + current student message) with proper logging is provided to the prompt so that it can answer properly with an addition of summary_service.py file.

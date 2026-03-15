@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+models/
+checkpoints/
+*.wav
+*.mp3
+.cache/
