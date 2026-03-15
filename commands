@@ -23,6 +23,7 @@ cd "C:\Program Files\Redis"
 Start OLLAMA:
 cd "C:\Users\DELL\Desktop\Shikshak\Techer_llm"
 conda activate ai-teacher
+ollama pull nomic-embed-text
 ollama serve
 
 Chatbot:
