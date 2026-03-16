@@ -93,6 +93,14 @@ def main() -> None:
         embedding_service=embedding_service,
     )
 
+    # Warm up the background model so it's loaded before polling starts.
+    print("Loading background model into VRAM...", end="", flush=True)
+    try:
+        llm.bg_client.chat(model=llm.bg_model, messages=[{"role": "user", "content": "hi"}])
+    except Exception as exc:
+        logger.warning("Background model warmup failed | error=%s", exc)
+    print(" done.")
+
     logger.info(
         "Memory worker ready | poll_interval=%ss | bg_model=%s",
         POLL_INTERVAL_SECONDS,

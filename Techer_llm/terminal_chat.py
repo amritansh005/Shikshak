@@ -92,6 +92,19 @@ def main() -> None:
     # across consecutive fast turns.
     _summary_lock = threading.Lock()
 
+    # Warm up models so they're loaded in VRAM before the student types.
+    # These are throwaway calls — nothing is saved to SQLite or Redis.
+    print("Loading models into VRAM...", end="", flush=True)
+    try:
+        llm.fg_client.chat(model=llm.model, messages=[{"role": "user", "content": "hi"}])
+    except Exception as exc:
+        logger.warning("Foreground model warmup failed | error=%s", exc)
+    try:
+        llm.bg_client.chat(model=llm.bg_model, messages=[{"role": "user", "content": "hi"}])
+    except Exception as exc:
+        logger.warning("Background model warmup failed | error=%s", exc)
+    print(" done.")
+
     print("AI Teacher is ready.")
     print(f"Session ID: {SESSION_ID}")
     print("Type 'exit' to stop.\n")
