@@ -33,3 +33,8 @@ Chatbot:
 cd "C:\Users\DELL\Desktop\Shikshak\Techer_llm"
 conda activate ai-teacher
 python terminal_chat.py
+
+
+ cd "C:\Users\DELL\Desktop\Shikshak\techer_llm"    
+conda activate ai-teacher
+python memory_worker.py

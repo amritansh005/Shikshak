@@ -81,10 +81,19 @@ class ChatMemoryService:
                     session_id TEXT NOT NULL,
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
-                    created_at REAL NOT NULL
+                    created_at REAL NOT NULL,
+                    memory_extracted INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
+            # Migration: add column to existing databases that lack it.
+            try:
+                conn.execute(
+                    "ALTER TABLE chat_messages ADD COLUMN memory_extracted INTEGER NOT NULL DEFAULT 0"
+                )
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_chat_messages_session_created
@@ -300,6 +309,78 @@ class ChatMemoryService:
                 for row in rows
                 if row[1] in {"user", "assistant"}
             ]
+        finally:
+            conn.close()
+
+    # ─────────────────────────────────────────────────────────────────
+    # MEMORY WORKER METHODS
+    # ─────────────────────────────────────────────────────────────────
+
+    def get_unprocessed_turns(self) -> List[Dict[str, Any]]:
+        """Return the oldest assistant message that has not been processed for memory extraction.
+
+        Returns up to 1 turn (user + assistant pair) at a time so the worker
+        processes them sequentially.
+        """
+        conn = sqlite3.connect(self.sqlite_db_path)
+        try:
+            # Find the oldest unprocessed assistant message.
+            cursor = conn.execute(
+                """
+                SELECT id, session_id, content, created_at
+                FROM chat_messages
+                WHERE memory_extracted = 0 AND role = 'assistant'
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+            )
+            row = cursor.fetchone()
+            if not row:
+                return []
+
+            assistant_id = row[0]
+            session_id = row[1]
+
+            # Grab up to 4 messages ending at this assistant message for context.
+            cursor2 = conn.execute(
+                """
+                SELECT id, role, content, created_at
+                FROM chat_messages
+                WHERE session_id = ? AND id <= ?
+                ORDER BY id DESC
+                LIMIT 4
+                """,
+                (session_id, assistant_id),
+            )
+            rows = cursor2.fetchall()
+            rows.reverse()
+            return [
+                {
+                    "id": r[0],
+                    "role": r[1],
+                    "content": r[2],
+                    "created_at": r[3],
+                    "session_id": session_id,
+                }
+                for r in rows
+                if r[1] in {"user", "assistant"}
+            ]
+        finally:
+            conn.close()
+
+    def mark_turn_as_extracted(self, up_to_message_id: int) -> None:
+        """Mark user and assistant messages up to the given id as memory_extracted = 1."""
+        conn = sqlite3.connect(self.sqlite_db_path)
+        try:
+            conn.execute(
+                """
+                UPDATE chat_messages
+                SET memory_extracted = 1
+                WHERE id <= ? AND memory_extracted = 0
+                """,
+                (up_to_message_id,),
+            )
+            conn.commit()
         finally:
             conn.close()
 

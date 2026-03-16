@@ -60,11 +60,23 @@ class MemoryCardService:
         self.embedding_service = embedding_service
 
     def extract_and_store_memory_card_for_latest_turn(self, session_id: str) -> None:
+        """Called from the chat loop background thread (legacy path)."""
         latest_messages = self.memory.get_latest_n_messages_from_sqlite(session_id, 4)
         if len(latest_messages) < 2:
             return
+        self._extract_and_store(session_id, latest_messages)
 
-        formatted = self._format_messages(latest_messages)
+    def extract_and_store_memory_card_from_messages(
+        self, session_id: str, messages: List[dict]
+    ) -> None:
+        """Called from memory_worker.py with pre-fetched messages."""
+        if len(messages) < 2:
+            return
+        self._extract_and_store(session_id, messages)
+
+    def _extract_and_store(self, session_id: str, messages: List[dict]) -> None:
+        """Shared extraction logic used by both entry points."""
+        formatted = self._format_messages(messages)
 
         user_prompt = f"""
 Latest messages:
@@ -88,11 +100,11 @@ Only skip (should_create_memory=false) if this is purely a greeting, thanks, or 
             return
 
         if not parsed.should_create_memory:
-            if self._looks_like_teaching_exchange(latest_messages):
+            if self._looks_like_teaching_exchange(messages):
                 logger.info(
                     "LLM declined memory creation, but teaching-exchange heuristic triggered. Creating fallback memory card."
                 )
-                parsed = self._build_fallback_memory(latest_messages)
+                parsed = self._build_fallback_memory(messages)
             else:
                 logger.info("Memory extraction decided not to create memory card.")
                 return

@@ -22,64 +22,51 @@ logger = logging.getLogger(__name__)
 #
 #   Instance 2 (CPU, port 11435):
 #     • structured_chat() — background tasks like memory-card extraction,
-#       recall decisions, etc.
-#     • Runs qwen2.5:0.5b on CPU. Slower, but nobody is waiting for it.
+#       recall decisions, summary generation, etc.
+#     • Runs gemma2:2b on CPU.
 #
-# Because these are separate OS processes, they NEVER block each other.
-# No locks needed. The student's foreground response is always instant,
-# regardless of whether a background task is running.
-#
-# To start Instance 2 (CPU-only):
-#   Linux/macOS:
-#     OLLAMA_HOST=127.0.0.1:11435 CUDA_VISIBLE_DEVICES="" ollama serve
-#   Windows (PowerShell):
-#     $env:OLLAMA_HOST="127.0.0.1:11435"; $env:CUDA_VISIBLE_DEVICES=""; ollama serve
-#
-# Then pull the small model on Instance 2:
-#   Linux/macOS:
-#     OLLAMA_HOST=127.0.0.1:11435 ollama pull qwen2.5:0.5b
-#   Windows (PowerShell):
-#     $env:OLLAMA_HOST="127.0.0.1:11435"; ollama pull qwen2.5:0.5b
+# Memory card extraction is handled by a SEPARATE worker process
+# (memory_worker.py) that reads unprocessed turns from SQLite and
+# sends them to Instance 2. This means the chat loop never skips
+# memory cards, no matter how fast the student types.
 
 AI_TEACHER_SYSTEM_PROMPT = """
-You are one of the best teachers in the world.
- 
-You teach many subjects such as science, mathematics, history, arts, social sciences, and other topics.
- 
-You are kind, patient, curious, and knowledgeable.
- 
-Your goal is to help students understand ideas clearly, not just memorize answers.
- 
-Top priorities (follow these in every reply):
- 
-- Be honest. If you do not know something, say you do not know. Do not guess. Do not make up facts.
-- Teach step by step like a good teacher. Keep steps short and clear.
-- Talk like a warm, natural, supportive teacher. Be friendly and encouraging.
-- If a student is rude or harsh, stay calm, polite, and generous.
- 
-Teaching rules:
- 
-1. Explain ideas in simple words.
-2. Break difficult concepts into small steps.
-3. Help students understand why something works, not just the final answer.
-4. Use real-life examples, stories, and analogies.
-5. Show connections between ideas when it helps learning.
-6. If a student is confused, explain again in a different way.
-7. If the student says something vague like "let's study physics" or "teach me math" without a specific question or topic, do NOT start a full lesson on a random subtopic. Instead, ask the student what specific topic or concept they want to start with. You can suggest 2-3 options to help them choose.
- 
-Default answer format:
- 
-1) Step-by-step explanation
-2) One example or analogy
-3) Short summary (1-3 lines)
- 
-Response style:
- 
-- Use clear and simple language.
-- Use short paragraphs.
-- Avoid unnecessary technical words unless needed.
- 
-Your mission is to make learning easy, clear, and enjoyable for students.
+You are an excellent teacher.
+
+You can teach many subjects such as science, mathematics, history, arts, and general knowledge.
+
+Your goal is to help students truly understand ideas, not just memorize answers.
+
+Teaching behavior:
+
+- Explain ideas in simple language.
+- Teach step by step like a good teacher.
+- Keep explanations clear and not too long.
+- Focus on the key idea first, then add details if needed.
+- Use examples or analogies when they help understanding.
+- If the student is confused, explain again in a simpler way.
+- If you do not know something, say you do not know.
+
+Conversation style:
+
+- Talk like a friendly and supportive teacher.
+- Be natural, not like a textbook.
+- Do NOT ask a follow-up question every time.
+- Ask questions only when it genuinely helps learning.
+
+When the student asks a question:
+
+1. Explain the concept clearly.
+2. Give a simple example or analogy if useful.
+3. Give a short summary in 1–2 lines.
+
+If the student says something vague like:
+"I want to study physics" or "teach me math"
+
+Do NOT start a random lesson.  
+Instead ask what specific topic they want to learn and suggest 2–3 possible topics.
+
+Your mission is to make learning clear, simple, and enjoyable.
 """.strip()
 
 
@@ -94,7 +81,7 @@ class LLMService:
         self.fg_client = ollama.Client(host=fg_host)
 
         # ── Background (CPU) ─────────────────────────────────────────
-        self.bg_model = os.getenv("BG_LLM_MODEL", "qwen2.5:0.5b")
+        self.bg_model = os.getenv("BG_LLM_MODEL", "gemma2:2b")
         bg_host = os.getenv("OLLAMA_BG_HOST", "http://127.0.0.1:11435")
         self.bg_client = ollama.Client(host=bg_host)
 

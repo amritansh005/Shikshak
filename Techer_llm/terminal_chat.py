@@ -7,7 +7,6 @@ import requests
 from app.services.chat_memory import ChatMemoryService
 from app.services.embedding_service import EmbeddingService
 from app.services.llm_service import LLMService
-from app.services.memory_card_service import MemoryCardService
 from app.services.recall_service import RecallService
 from app.services.summary_service import SummaryService
 
@@ -83,23 +82,15 @@ def main() -> None:
     memory = ChatMemoryService()
     summary_service = SummaryService(llm=llm)
     embedding_service = EmbeddingService(llm=llm)
-    memory_card_service = MemoryCardService(
-        llm=llm,
-        memory=memory,
-        embedding_service=embedding_service,
-    )
     recall_service = RecallService(
         llm=llm,
         memory=memory,
         embedding_service=embedding_service,
     )
 
-    # Per-type locks prevent overlapping runs of the same background
-    # job type across consecutive fast turns.  These are lightweight
-    # — they only guard against duplicate background threads, NOT
-    # against Ollama contention (which is gone now with two instances).
+    # Lock prevents overlapping runs of the summary background job
+    # across consecutive fast turns.
     _summary_lock = threading.Lock()
-    _memory_card_lock = threading.Lock()
 
     print("AI Teacher is ready.")
     print(f"Session ID: {SESSION_ID}")
@@ -256,27 +247,7 @@ def main() -> None:
                 finally:
                     _summary_lock.release()
 
-            def _extract_memory_background() -> None:
-                if not _memory_card_lock.acquire(blocking=False):
-                    logger.info(
-                        "Memory card extraction skipped — previous extraction still running."
-                    )
-                    return
-                try:
-                    logger.info("Memory card extraction started.")
-                    memory_card_service.extract_and_store_memory_card_for_latest_turn(
-                        session_id=_snapshot_session_id,
-                    )
-                    logger.info("Memory card extraction completed.")
-                except Exception as exc:
-                    logger.warning(
-                        "Memory card extraction failed | error=%s", exc
-                    )
-                finally:
-                    _memory_card_lock.release()
-
             threading.Thread(target=_update_summary_background, daemon=True).start()
-            threading.Thread(target=_extract_memory_background, daemon=True).start()
 
             print("\n\n")
 
