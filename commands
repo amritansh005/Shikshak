@@ -29,12 +29,12 @@ ollama serve
 .\start_bg_ollama.ps1
 For memory card model- $env:OLLAMA_HOST="127.0.0.1:11435"; ollama pull gemma2:2b
 
+cd "C:\Users\DELL\Desktop\Shikshak\techer_llm"    
+conda activate ai-teacher
+python memory_worker.py
+
 Chatbot:
 cd "C:\Users\DELL\Desktop\Shikshak\Techer_llm"
 conda activate ai-teacher
 python terminal_chat.py
 
-
- cd "C:\Users\DELL\Desktop\Shikshak\techer_llm"    
-conda activate ai-teacher
-python memory_worker.py
