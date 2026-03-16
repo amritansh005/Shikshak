@@ -12,16 +12,82 @@ logger = logging.getLogger(__name__)
 RECALL_DECISION_SYSTEM_PROMPT = """
 You decide whether the student's current message needs exact older teaching memory.
 
-Say recall is needed when the student is clearly asking for:
-- an old example again
-- the previous way of explanation
-- something explained earlier
-- a past analogy
-- the same method as before
+Very important rule:
+Only trigger recall when the student explicitly refers to something from earlier.
 
-Do not trigger recall for normal new questions.
+Explicit earlier-reference cues include phrases like:
+- again
+- before
+- earlier
+- previously
+- last time
+- same as before
+- like before
+- the example you gave
+- the way you explained before
+- explain that again
+- tell me that example again
 
-Also give the most likely topic in short form if possible.
+Do NOT trigger recall for normal ongoing teaching or topic progression.
+
+Normal teaching / continuation requests are not recall. This includes:
+- starting a topic
+- asking to learn a concept
+- asking for more examples
+- asking the next question in the lesson
+- asking to explain a concept directly
+- asking about a subtopic currently being discussed
+
+Examples of normal teaching / continuation:
+- let's study this topic
+- teach me quantum mechanics
+- help me understand algebra
+- explain photosynthesis
+- give 2 more examples
+- what's the next law?
+- what is friction?
+- explain this example
+
+Your job is to detect 3 things carefully:
+1. Whether the student is explicitly asking to revisit something from earlier.
+2. Whether the earlier topic is clear enough for safe memory retrieval.
+3. Whether the teacher should ask for clarification instead of recalling memory.
+
+Rules:
+- If there is NO explicit earlier-reference cue, then:
+  - recall_needed = false
+  - topic_clear_for_recall = false
+  - needs_recall_clarification = false
+
+- If the student explicitly refers to something earlier, but the exact topic is vague or unclear:
+  - recall_needed = true
+  - topic_clear_for_recall = false
+  - needs_recall_clarification = true
+
+Examples of vague recall:
+- again
+- explain again
+- say that again
+- do it like before
+- same as earlier
+- that part again
+
+Examples of clear recall:
+- explain Newton's first law again
+- tell the atom example again
+- explain photosynthesis in the same way as before
+- give the toy car example again
+
+In clear recall cases:
+- recall_needed = true
+- topic_clear_for_recall = true
+- needs_recall_clarification = false
+
+Also:
+- likely_topic should be a short topic name if it can be identified
+- clarification_question should be short and teacher-like when clarification is needed
+- fresh_teach_topic should contain the most likely topic to offer fresh teaching, if possible
+
 Return only valid JSON matching the schema.
 """.strip()
 
@@ -52,6 +118,13 @@ class RecallService:
 
         if not decision or not decision.recall_needed:
             logger.info("Recall not needed for this turn.")
+            return None
+
+        if decision.needs_recall_clarification or not decision.topic_clear_for_recall:
+            logger.info(
+                "Recall skipped because earlier topic is unclear | likely_topic=%s",
+                decision.likely_topic,
+            )
             return None
 
         if self._recent_history_already_covers_request(user_message, history_messages):
@@ -113,12 +186,40 @@ class RecallService:
             "snippet": best_card.get("snippet", ""),
         }
 
+    def get_recall_decision_for_turn(
+        self,
+        user_message: str,
+        history_messages: List[Dict[str, str]],
+        conversation_summary: str,
+    ) -> RecallDecisionSchema:
+        decision = self._detect_recall_intent(
+            user_message=user_message,
+            history_messages=history_messages,
+            conversation_summary=conversation_summary,
+        )
+        return decision or RecallDecisionSchema()
+
     def _detect_recall_intent(
         self,
         user_message: str,
         history_messages: List[Dict[str, str]],
         conversation_summary: str,
     ) -> Optional[RecallDecisionSchema]:
+        lowered = user_message.lower().strip()
+
+        if not self._has_explicit_recall_cue(lowered):
+            return RecallDecisionSchema(
+                recall_needed=False,
+                recall_reason="no_explicit_recall_cue",
+                likely_topic="",
+                wants_old_example=False,
+                wants_old_explanation_style=False,
+                topic_clear_for_recall=False,
+                needs_recall_clarification=False,
+                clarification_question="",
+                fresh_teach_topic="",
+            )
+
         formatted_history = self._format_history(history_messages)
 
         user_prompt = f"""
@@ -131,7 +232,13 @@ Recent chat:
 Older summary:
 {conversation_summary.strip() if conversation_summary.strip() else "None"}
 
-Decide whether exact older memory is needed for this turn.
+Decide:
+1. Is the student explicitly asking for older teaching memory?
+2. If yes, is the earlier topic clear enough for safe recall?
+3. If not clear, should the teacher ask for clarification and offer fresh teaching?
+
+Be strict.
+If the student is only continuing the lesson normally, then recall is not needed.
 """.strip()
 
         parsed = self.llm.structured_chat(
@@ -142,31 +249,102 @@ Decide whether exact older memory is needed for this turn.
         )
 
         if parsed:
+            if not parsed.recall_needed:
+                parsed.topic_clear_for_recall = False
+                parsed.needs_recall_clarification = False
+                parsed.clarification_question = parsed.clarification_question or ""
+                return parsed
+
             return parsed
 
-        lowered = user_message.lower()
-        fallback = any(
-            phrase in lowered
-            for phrase in (
-                "like before",
-                "as before",
-                "earlier",
-                "previously",
-                "same example",
-                "same way",
-                "again",
-                "old example",
-                "last time",
-            )
+        strong_clear_recall_phrases = (
+            "explain that again",
+            "tell me that again",
+            "say that again",
+            "give that example again",
+            "the example you gave",
+            "the way you explained before",
+            "same example",
+            "same way",
+            "like before",
+            "as before",
+            "last time",
+            "previously",
+            "earlier",
+            "same as before",
+            "same as earlier",
         )
 
-        return RecallDecisionSchema(
-            recall_needed=fallback,
-            recall_reason="fallback_phrase_match" if fallback else "",
-            likely_topic="",
-            wants_old_example=fallback,
-            wants_old_explanation_style=fallback,
+        vague_recall_phrases = (
+            "again",
+            "explain again",
+            "do it again",
+            "that again",
+            "that part again",
         )
+
+        if lowered in vague_recall_phrases:
+            return RecallDecisionSchema(
+                recall_needed=True,
+                recall_reason="fallback_vague_recall_phrase_match",
+                likely_topic="",
+                wants_old_example=False,
+                wants_old_explanation_style=False,
+                topic_clear_for_recall=False,
+                needs_recall_clarification=True,
+                clarification_question=(
+                    "I’m not fully sure which earlier part you mean. Do you want the concept, example, or steps again?"
+                ),
+                fresh_teach_topic="",
+            )
+
+        if any(phrase in lowered for phrase in strong_clear_recall_phrases):
+            return RecallDecisionSchema(
+                recall_needed=True,
+                recall_reason="fallback_explicit_recall_phrase_match",
+                likely_topic="",
+                wants_old_example=True,
+                wants_old_explanation_style=True,
+                topic_clear_for_recall=False,
+                needs_recall_clarification=True,
+                clarification_question=(
+                    "Which exact earlier part do you want again? The concept, example, or steps?"
+                ),
+                fresh_teach_topic="",
+            )
+
+        return RecallDecisionSchema(
+            recall_needed=False,
+            recall_reason="fallback_no_safe_recall_match",
+            likely_topic="",
+            wants_old_example=False,
+            wants_old_explanation_style=False,
+            topic_clear_for_recall=False,
+            needs_recall_clarification=False,
+            clarification_question="",
+            fresh_teach_topic="",
+        )
+
+    @staticmethod
+    def _has_explicit_recall_cue(lowered_message: str) -> bool:
+        explicit_cues = (
+            "again",
+            "before",
+            "earlier",
+            "previously",
+            "last time",
+            "same as before",
+            "same as earlier",
+            "like before",
+            "as before",
+            "old example",
+            "same example",
+            "same way",
+            "the example you gave",
+            "the way you explained before",
+            "repeat",
+        )
+        return any(cue in lowered_message for cue in explicit_cues)
 
     @staticmethod
     def _format_history(history_messages: List[Dict[str, str]]) -> str:
@@ -229,7 +407,20 @@ Decide whether exact older memory is needed for this turn.
         history_messages: List[Dict[str, str]],
     ) -> bool:
         lowered = user_message.lower()
-        if "again" not in lowered and "before" not in lowered and "earlier" not in lowered:
+
+        explicit_recall_cues = (
+            "before",
+            "earlier",
+            "last time",
+            "like before",
+            "same example",
+            "same way",
+            "previously",
+            "again",
+            "repeat",
+        )
+
+        if not any(cue in lowered for cue in explicit_recall_cues):
             return False
 
         combined_recent = " ".join(

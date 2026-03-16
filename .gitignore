@@ -40,3 +40,5 @@ Thumbs.db
 
 *.build_order.txt
 *.commands.txt
+build_order.txt
+commands.txt

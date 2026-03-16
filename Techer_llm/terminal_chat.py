@@ -47,6 +47,28 @@ def _setup_logging() -> None:
     root.addHandler(handler)
 
 
+def _has_explicit_recall_cue(message: str) -> bool:
+    lowered = message.lower().strip()
+    explicit_cues = (
+        "again",
+        "before",
+        "earlier",
+        "previously",
+        "last time",
+        "same as before",
+        "same as earlier",
+        "like before",
+        "as before",
+        "old example",
+        "same example",
+        "same way",
+        "the example you gave",
+        "the way you explained before",
+        "repeat",
+    )
+    return any(cue in lowered for cue in explicit_cues)
+
+
 _setup_logging()
 logger = logging.getLogger(__name__)
 
@@ -54,10 +76,13 @@ SESSION_ID = f"session-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
 
 def main() -> None:
+    # ── Service initialisation ────────────────────────────────────
+    # LLMService is created first because other services depend on
+    # its bg_client (CPU Ollama instance) for background work.
     llm = LLMService()
     memory = ChatMemoryService()
-    summary_service = SummaryService()
-    embedding_service = EmbeddingService()
+    summary_service = SummaryService(llm=llm)
+    embedding_service = EmbeddingService(llm=llm)
     memory_card_service = MemoryCardService(
         llm=llm,
         memory=memory,
@@ -68,6 +93,13 @@ def main() -> None:
         memory=memory,
         embedding_service=embedding_service,
     )
+
+    # Per-type locks prevent overlapping runs of the same background
+    # job type across consecutive fast turns.  These are lightweight
+    # — they only guard against duplicate background threads, NOT
+    # against Ollama contention (which is gone now with two instances).
+    _summary_lock = threading.Lock()
+    _memory_card_lock = threading.Lock()
 
     print("AI Teacher is ready.")
     print(f"Session ID: {SESSION_ID}")
@@ -99,7 +131,7 @@ def main() -> None:
             break
 
         if not user_input:
-            continue  # Silent re-prompt — avoids printing a message that looks like the teacher speaking
+            continue
 
         try:
             logger.info(
@@ -111,18 +143,58 @@ def main() -> None:
             conversation_summary = memory.get_conversation_summary_for_prompt(SESSION_ID)
             history_messages = memory.get_recent_history_for_prompt(SESSION_ID)
 
-            recalled_memory = recall_service.get_recalled_memory_for_turn(
-                session_id=SESSION_ID,
+            recall_decision = recall_service.get_recall_decision_for_turn(
                 user_message=user_input,
                 history_messages=history_messages,
                 conversation_summary=conversation_summary,
             )
 
+            recalled_memory = None
+            recall_clarification_mode = False
+            recall_clarification_question = ""
+            fresh_teach_topic = ""
+
+            explicit_recall_cue_present = _has_explicit_recall_cue(user_input)
+
+            if recall_decision.recall_needed and explicit_recall_cue_present:
+                if (
+                    recall_decision.needs_recall_clarification
+                    or not recall_decision.topic_clear_for_recall
+                ):
+                    recall_clarification_mode = True
+                    recall_clarification_question = (
+                        recall_decision.clarification_question or ""
+                    ).strip()
+                    fresh_teach_topic = (
+                        recall_decision.fresh_teach_topic
+                        or recall_decision.likely_topic
+                        or ""
+                    ).strip()
+
+                    logger.info(
+                        "Recall clarification mode activated | likely_topic=%s | clarification_question=%r | fresh_teach_topic=%r",
+                        recall_decision.likely_topic,
+                        recall_clarification_question,
+                        fresh_teach_topic,
+                    )
+                else:
+                    recalled_memory = recall_service.get_recalled_memory_for_turn(
+                        session_id=SESSION_ID,
+                        user_message=user_input,
+                        history_messages=history_messages,
+                        conversation_summary=conversation_summary,
+                    )
+            elif recall_decision.recall_needed and not explicit_recall_cue_present:
+                logger.info(
+                    "Recall decision ignored because no explicit recall cue was found in user message."
+                )
+
             logger.info(
-                "Prompt context prepared | summary_chars=%s | recent_history_count=%s | recalled_memory=%s",
+                "Prompt context prepared | summary_chars=%s | recent_history_count=%s | recalled_memory=%s | recall_clarification_mode=%s",
                 len(conversation_summary or ""),
                 len(history_messages),
                 bool(recalled_memory),
+                recall_clarification_mode,
             )
 
             print("\nTeacher: ", end="", flush=True)
@@ -134,6 +206,9 @@ def main() -> None:
                 history_messages=history_messages,
                 conversation_summary=conversation_summary,
                 recalled_memory=recalled_memory,
+                recall_clarification_mode=recall_clarification_mode,
+                recall_clarification_question=recall_clarification_question,
+                fresh_teach_topic=fresh_teach_topic,
             ):
                 print(token, end="", flush=True)
                 full_response += token
@@ -158,18 +233,50 @@ def main() -> None:
 
             logger.info("Current turn messages saved to Redis/SQLite.")
 
-            logger.info("Older conversation summary update started.")
-            memory.update_older_conversation_summary(
-                session_id=SESSION_ID,
-                summary_service=summary_service,
-            )
-            logger.info("Older conversation summary update completed.")
+            # Snapshot session_id for background closures.
+            _snapshot_session_id = SESSION_ID
 
-            logger.info("Memory card extraction started.")
-            memory_card_service.extract_and_store_memory_card_for_latest_turn(
-                session_id=SESSION_ID,
-            )
-            logger.info("Memory card extraction completed.")
+            def _update_summary_background() -> None:
+                if not _summary_lock.acquire(blocking=False):
+                    logger.info(
+                        "Summary update skipped — previous update still running."
+                    )
+                    return
+                try:
+                    logger.info("Older conversation summary update started.")
+                    memory.update_older_conversation_summary(
+                        session_id=_snapshot_session_id,
+                        summary_service=summary_service,
+                    )
+                    logger.info("Older conversation summary update completed.")
+                except Exception as exc:
+                    logger.warning(
+                        "Older conversation summary update failed | error=%s", exc
+                    )
+                finally:
+                    _summary_lock.release()
+
+            def _extract_memory_background() -> None:
+                if not _memory_card_lock.acquire(blocking=False):
+                    logger.info(
+                        "Memory card extraction skipped — previous extraction still running."
+                    )
+                    return
+                try:
+                    logger.info("Memory card extraction started.")
+                    memory_card_service.extract_and_store_memory_card_for_latest_turn(
+                        session_id=_snapshot_session_id,
+                    )
+                    logger.info("Memory card extraction completed.")
+                except Exception as exc:
+                    logger.warning(
+                        "Memory card extraction failed | error=%s", exc
+                    )
+                finally:
+                    _memory_card_lock.release()
+
+            threading.Thread(target=_update_summary_background, daemon=True).start()
+            threading.Thread(target=_extract_memory_background, daemon=True).start()
 
             print("\n\n")
 

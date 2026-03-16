@@ -4,7 +4,6 @@ import logging
 import os
 from typing import Dict, List
 
-import ollama
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -40,13 +39,14 @@ Rules:
 
 
 class SummaryService:
-    def __init__(self) -> None:
-        self.model = os.getenv("SUMMARY_MODEL", os.getenv("LLM_MODEL", "qwen2.5:3b"))
+    def __init__(self, llm) -> None:
+        """Accept an LLMService instance to reuse its background Ollama client."""
+        self.llm = llm
         self.temperature = float(os.getenv("SUMMARY_TEMPERATURE", "0.2"))
 
         logger.info(
-            "SummaryService initialised | model=%s | temperature=%s",
-            self.model,
+            "SummaryService initialised | bg_model=%s | temperature=%s",
+            self.llm.bg_model,
             self.temperature,
         )
 
@@ -71,18 +71,24 @@ Update the summary.
 Return only the updated summary text.
 """.strip()
 
-        response = ollama.chat(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            stream=False,
-            options={"temperature": self.temperature},
-        )
+        try:
+            logger.info("Background summary generation started.")
+            response = self.llm.bg_client.chat(
+                model=self.llm.bg_model,
+                messages=[
+                    {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                stream=False,
+                options={"temperature": self.temperature},
+            )
+            logger.info("Background summary generation completed.")
 
-        content = response["message"]["content"].strip()
-        return content or previous_summary.strip()
+            content = response["message"]["content"].strip()
+            return content or previous_summary.strip()
+        except Exception as e:
+            logger.warning("Summary generation failed | error=%s", e)
+            return previous_summary.strip()
 
     def _format_messages(self, messages: List[Dict[str, str]]) -> str:
         lines: List[str] = []
