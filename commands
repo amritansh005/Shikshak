@@ -2,6 +2,7 @@ Whisper environment-
 conda create -n whisper-env python=3.10 -y- (Python version: Python 3.10.20)
 cd "C:\Users\DELL\Desktop\Shikshak\STT"
 conda activate whisper-env
+python voice_chat_client.py
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 pip install faster-whisper
 $env:Path = "C:\ffmpeg-8.0.1-essentials_build\bin;$env:Path"

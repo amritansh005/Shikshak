@@ -1,4 +1,10 @@
-torch
-torchvision
-torchaudio
 faster-whisper
+numpy
+sounddevice
+scipy
+webrtcvad-wheels
+fastapi
+uvicorn
+python-multipart
+requests
+python-dotenv
