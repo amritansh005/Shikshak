@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -50,7 +49,13 @@ class TurnState:
         self.soft_end_timestamp = 0.0
 
     def snapshot_audio(self) -> bytes:
-        return b"".join(self.frames)
+        """Return a copy of all accumulated PCM frames as a single bytes object.
+        
+        NOTE: The caller MUST hold the lock that guards this TurnState
+        before calling this method, since self.frames is mutated by the
+        main loop thread.
+        """
+        return b"".join(list(self.frames))
 
     def latest_partial(self) -> str:
         return self.partial_history[-1].text if self.partial_history else ""
@@ -68,36 +73,69 @@ class TurnManager:
     It intentionally avoids LLM calls for endpointing so the pipeline stays fast.
     """
 
-    INCOMPLETE_ENDINGS = {
-        "and", "or", "but", "so", "because", "if", "then", "than", "to", "for",
-        "of", "in", "on", "at", "with", "from", "into", "about", "like", "that",
-        "which", "who", "whom", "whose", "when", "where", "while", "as", "by",
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-        "do", "does", "did", "can", "could", "should", "would", "will", "please",
-        "uh", "um", "hmm", "actually", "also", "first", "second", "third", "explain",
-        "tell", "show", "give", "what", "why", "how", "where", "when", "whether",
-        "this", "that", "these", "those", "my", "your", "our", "their", "his", "her",
-        "more", "another", "about", "regarding", "means", "meaning", "called",
-    }
-
-    FILLER_WORDS = {
-        "uh", "um", "hmm", "huh", "ah", "er", "erm", "mm", "mmm", "like", "so",
-        "well", "okay", "ok", "wait", "actually", "basically", "you", "know",
-    }
-
-    NON_MEANINGFUL_PHRASES = {
-        "uh", "um", "hmm", "huh", "ah", "er", "erm", "mm", "okay", "ok", "wait",
-        "one second", "just a second", "hold on", "let me think",
-    }
-
-    QUESTION_STARTERS = {
-        "what", "why", "how", "when", "where", "who", "whom", "whose", "which", "can",
-        "could", "would", "will", "should", "is", "are", "do", "does", "did", "tell",
-        "explain", "show", "teach", "help", "please",
+    # ── Per-language word lists ──────────────────────────────────────────
+    _LANG = {
+        "en": {
+            "incomplete_endings": {
+                "and", "or", "but", "so", "because", "if", "then", "than", "to", "for",
+                "of", "in", "on", "at", "with", "from", "into", "about", "like", "that",
+                "which", "who", "whom", "whose", "when", "where", "while", "as", "by",
+                "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+                "do", "does", "did", "can", "could", "should", "would", "will", "please",
+                "uh", "um", "hmm", "actually", "also", "first", "second", "third", "explain",
+                "tell", "show", "give", "what", "why", "how", "where", "when", "whether",
+                "this", "that", "these", "those", "my", "your", "our", "their", "his", "her",
+                "more", "another", "about", "regarding", "means", "meaning", "called",
+            },
+            "filler_words": {
+                "uh", "um", "hmm", "huh", "ah", "er", "erm", "mm", "mmm", "like", "so",
+                "well", "okay", "ok", "wait", "actually", "basically", "you", "know",
+            },
+            "non_meaningful_phrases": {
+                "uh", "um", "hmm", "huh", "ah", "er", "erm", "mm", "okay", "ok", "wait",
+                "one second", "just a second", "hold on", "let me think",
+            },
+            "question_starters": {
+                "what", "why", "how", "when", "where", "who", "whom", "whose", "which", "can",
+                "could", "would", "will", "should", "is", "are", "do", "does", "did", "tell",
+                "explain", "show", "teach", "help", "please",
+            },
+        },
+        "hi": {
+            "incomplete_endings": {
+                "aur", "ya", "lekin", "par", "kyunki", "agar", "toh", "phir", "ke", "ki",
+                "ka", "ko", "se", "mein", "par", "tak", "ne", "hai", "hain", "tha", "the",
+                "thi", "ho", "hoga", "hogi", "honge", "kya", "kaise", "kahan", "kab", "kaun",
+                "konsa", "konsi", "jaise", "matlab", "woh", "yeh", "ye", "mera", "meri",
+                "tumhara", "tumhari", "hamara", "hamari", "unka", "unki", "iska", "iski",
+                "samjhao", "batao", "dikhao", "pehle", "doosra", "teesra",
+            },
+            "filler_words": {
+                "uh", "um", "hmm", "huh", "ah", "er", "mm", "mmm", "haan", "achha",
+                "theek", "bas", "matlab", "actually", "basically", "like", "so",
+                "dekho", "suno", "wait", "ruko",
+            },
+            "non_meaningful_phrases": {
+                "uh", "um", "hmm", "huh", "ah", "er", "mm", "haan", "achha", "theek",
+                "bas", "ruko", "ek second", "ek minute", "sochne do", "wait",
+            },
+            "question_starters": {
+                "kya", "kyun", "kaise", "kab", "kahan", "kaun", "konsa", "konsi",
+                "batao", "samjhao", "dikhao", "sikhao", "bolo", "help",
+            },
+        },
     }
 
     def __init__(self) -> None:
         self.frame_ms = settings.audio_frame_ms
+
+        lang = settings.whisper_language
+        lang_data = self._LANG.get(lang, self._LANG["en"])
+
+        self.INCOMPLETE_ENDINGS: set[str] = lang_data["incomplete_endings"]
+        self.FILLER_WORDS: set[str] = lang_data["filler_words"]
+        self.NON_MEANINGFUL_PHRASES: set[str] = lang_data["non_meaningful_phrases"]
+        self.QUESTION_STARTERS: set[str] = lang_data["question_starters"]
 
     def start_turn(self, state: TurnState) -> None:
         state.reset()
@@ -318,12 +356,18 @@ class TurnManager:
             age_ms = (time.monotonic() - newest.timestamp) * 1000
             return age_ms >= settings.turn_stable_wait_ms
 
-        a = newest.text
-        b = previous.text
-        shorter, longer = (b, a) if len(b) <= len(a) else (a, b)
-        if not shorter:
+        a_words = self._tokenize(newest.text)
+        b_words = self._tokenize(previous.text)
+        if not a_words or not b_words:
             return False
 
-        overlap = len(os.path.commonprefix([shorter, longer])) / max(1, len(shorter))
+        # Count how many words from the shorter list appear in the longer.
+        # This handles Whisper prepending/appending a word between partials
+        # (e.g. "explain photosynthesis" vs "can you explain photosynthesis").
+        shorter, longer = (b_words, a_words) if len(b_words) <= len(a_words) else (a_words, b_words)
+        longer_set = set(longer)
+        common = sum(1 for w in shorter if w in longer_set)
+        overlap = common / len(shorter)
+
         age_ms = (time.monotonic() - newest.timestamp) * 1000
         return overlap >= settings.turn_partial_stability_ratio and age_ms >= settings.turn_stable_wait_ms

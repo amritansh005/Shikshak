@@ -151,10 +151,7 @@ def main() -> None:
                     )
                     decision = turn_manager.evaluate(state.turn)
 
-                if audio_seconds <= settings.max_partial_window_seconds:
-                    maybe_launch_partial_transcription(state, stt, turn_manager)
-                else:
-                    maybe_launch_partial_transcription(state, stt, turn_manager)
+                maybe_launch_partial_transcription(state, stt, turn_manager)
 
                 if decision.action == "finalize":
                     finalize_turn(state, stt, turn_manager, session_id, streamer)

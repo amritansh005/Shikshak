@@ -37,7 +37,7 @@ class STTService:
             language=settings.whisper_language,
             task=settings.whisper_task,
             vad_filter=False,
-            condition_on_previous_text=True,
+            condition_on_previous_text=False,
         )
         if partial:
             kwargs.update(
