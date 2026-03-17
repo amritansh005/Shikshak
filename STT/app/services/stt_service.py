@@ -25,11 +25,11 @@ class STTService:
             settings.whisper_compute_type,
         )
 
-    def transcribe_bytes(self, audio_bytes: bytes, *, partial: bool = False) -> Dict[str, str]:
+    def transcribe_bytes(self, audio_bytes: bytes, *, partial: bool = False) -> Dict[str, object]:
         audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         return self.transcribe_array(audio, partial=partial)
 
-    def transcribe_array(self, audio: np.ndarray, *, partial: bool = False) -> Dict[str, str]:
+    def transcribe_array(self, audio: np.ndarray, *, partial: bool = False) -> Dict[str, object]:
         if audio.ndim != 1:
             audio = np.squeeze(audio)
 
@@ -57,9 +57,26 @@ class STTService:
             )
 
         segments, info = self.model.transcribe(audio, **kwargs)
-        text_parts: List[str] = [segment.text.strip() for segment in segments if segment.text.strip()]
+
+        text_parts: List[str] = []
+        no_speech_probs: List[float] = []
+
+        for segment in segments:
+            stripped = segment.text.strip()
+            if stripped:
+                text_parts.append(stripped)
+                no_speech_probs.append(segment.no_speech_prob)
+
         text = " ".join(text_parts).strip()
+
+        avg_no_speech_prob = (
+            sum(no_speech_probs) / len(no_speech_probs)
+            if no_speech_probs
+            else 1.0  # no segments = treat as no speech
+        )
+
         return {
             "text": text,
             "language": getattr(info, "language", settings.whisper_language) or settings.whisper_language,
+            "avg_no_speech_prob": avg_no_speech_prob,
         }

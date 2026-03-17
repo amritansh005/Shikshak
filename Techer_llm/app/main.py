@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from app.services.chat_memory import ChatMemoryService
 from app.services.embedding_service import EmbeddingService
+from app.services.emotion_state_service import EmotionStateService
 from app.services.llm_service import LLMService
 from app.services.recall_service import RecallService
 from app.services.summary_service import SummaryService
@@ -21,6 +22,7 @@ _memory: Optional[ChatMemoryService] = None
 _summary_service: Optional[SummaryService] = None
 _embedding_service: Optional[EmbeddingService] = None
 _recall_service: Optional[RecallService] = None
+_emotion_state: Optional[EmotionStateService] = None
 _summary_lock = threading.Lock()
 
 
@@ -48,7 +50,7 @@ def _has_explicit_recall_cue(message: str) -> bool:
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    global _llm, _memory, _summary_service, _embedding_service, _recall_service
+    global _llm, _memory, _summary_service, _embedding_service, _recall_service, _emotion_state
 
     logger.info("Initialising shared services...")
     _llm = LLMService()
@@ -60,6 +62,7 @@ async def lifespan(application: FastAPI):
         memory=_memory,
         embedding_service=_embedding_service,
     )
+    _emotion_state = EmotionStateService()
 
     # Warm up models
     logger.info("Warming up models...")
@@ -92,6 +95,7 @@ class LogRecord(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     session_id: str
+    emotion: Optional[dict] = None  # from STT voice client: {"text_emotion": {...}, "audio_emotion": {...}, "prosody": {...}}
 
 
 class ChatResponse(BaseModel):
@@ -186,6 +190,19 @@ def chat(req: ChatRequest) -> ChatResponse:
         recall_clarification_mode,
     )
 
+    # ── Emotion state tracking ───────────────────────────────────
+    emotion_instruction = ""
+    if req.emotion:
+        directive = _emotion_state.record_turn(session_id, req.emotion)
+        emotion_instruction = directive.instruction or ""
+        logger.info(
+            "Emotion directive | state=%s | smoothed=%s | trend=%s | instruction_chars=%d",
+            directive.teaching_state,
+            directive.smoothed_state,
+            directive.trend,
+            len(emotion_instruction),
+        )
+
     # ── Generate response (non-streaming for HTTP) ───────────────
     full_response = _llm.generate(
         user_message=user_input,
@@ -195,6 +212,7 @@ def chat(req: ChatRequest) -> ChatResponse:
         recall_clarification_mode=recall_clarification_mode,
         recall_clarification_question=recall_clarification_question,
         fresh_teach_topic=fresh_teach_topic,
+        emotion_instruction=emotion_instruction,
     )
 
     logger.info(

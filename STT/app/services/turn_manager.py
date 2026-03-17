@@ -90,10 +90,12 @@ class TurnManager:
             "filler_words": {
                 "uh", "um", "hmm", "huh", "ah", "er", "erm", "mm", "mmm", "like", "so",
                 "well", "okay", "ok", "wait", "actually", "basically", "you", "know",
+                "ahem",
             },
             "non_meaningful_phrases": {
                 "uh", "um", "hmm", "huh", "ah", "er", "erm", "mm", "okay", "ok", "wait",
                 "one second", "just a second", "hold on", "let me think",
+                "ahem", "hmm hmm", "mm hmm", "ugh",
             },
             "question_starters": {
                 "what", "why", "how", "when", "where", "who", "whom", "whose", "which", "can",
@@ -361,9 +363,6 @@ class TurnManager:
         if not a_words or not b_words:
             return False
 
-        # Count how many words from the shorter list appear in the longer.
-        # This handles Whisper prepending/appending a word between partials
-        # (e.g. "explain photosynthesis" vs "can you explain photosynthesis").
         shorter, longer = (b_words, a_words) if len(b_words) <= len(a_words) else (a_words, b_words)
         longer_set = set(longer)
         common = sum(1 for w in shorter if w in longer_set)

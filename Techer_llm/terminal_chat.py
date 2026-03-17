@@ -6,9 +6,11 @@ import requests
 
 from app.services.chat_memory import ChatMemoryService
 from app.services.embedding_service import EmbeddingService
+from app.services.emotion_state_service import EmotionStateService
 from app.services.llm_service import LLMService
 from app.services.recall_service import RecallService
 from app.services.summary_service import SummaryService
+from app.services.text_emotion_classifier import classify_text_emotion
 
 UVICORN_LOG_ENDPOINT = "http://127.0.0.1:8000/internal/log"
 
@@ -87,6 +89,7 @@ def main() -> None:
         memory=memory,
         embedding_service=embedding_service,
     )
+    emotion_state = EmotionStateService()
 
     # Lock prevents overlapping runs of the summary background job
     # across consecutive fast turns.
@@ -201,6 +204,23 @@ def main() -> None:
                 recall_clarification_mode,
             )
 
+            # ── Emotion detection (text only in terminal) ────────
+            text_emotion = classify_text_emotion(user_input)
+            emotion_data = {
+                "text_emotion": text_emotion,
+                "prosody": {},
+            }
+            directive = emotion_state.record_turn(SESSION_ID, emotion_data)
+            emotion_instruction = directive.instruction or ""
+
+            if text_emotion["label"] != "neutral":
+                logger.info(
+                    "Text emotion detected | label=%s | confidence=%.2f | trend=%s",
+                    text_emotion["label"],
+                    text_emotion["confidence"],
+                    directive.trend,
+                )
+
             print("\nTeacher: ", end="", flush=True)
 
             logger.info("Teacher response generation started.")
@@ -213,6 +233,7 @@ def main() -> None:
                 recall_clarification_mode=recall_clarification_mode,
                 recall_clarification_question=recall_clarification_question,
                 fresh_teach_topic=fresh_teach_topic,
+                emotion_instruction=emotion_instruction,
             ):
                 print(token, end="", flush=True)
                 full_response += token

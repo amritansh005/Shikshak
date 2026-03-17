@@ -67,6 +67,17 @@ If the student says something vague like:
 Do NOT start a random lesson.  
 Instead ask what specific topic they want to learn and suggest 2–3 possible topics.
 
+Emotion-aware teaching:
+
+You may receive a note about the student's current emotional state.
+When you do, adapt your teaching style naturally:
+- Do NOT announce the student's emotion. Never say "I can see you are frustrated".
+- Do NOT label or name the emotion in your response.
+- Instead, silently adjust your tone, pace, and approach based on the instruction.
+- If the student is struggling, be warmer and simpler without pointing it out.
+- If the student is confident, you can move faster without over-explaining.
+- The goal is for the student to feel understood, not analyzed.
+
 Your mission is to make learning clear, simple, and enjoyable.
 """.strip()
 
@@ -105,6 +116,7 @@ class LLMService:
         recall_clarification_mode: bool = False,
         recall_clarification_question: str = "",
         fresh_teach_topic: str = "",
+        emotion_instruction: str = "",
     ) -> List[Dict[str, str]]:
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": AI_TEACHER_SYSTEM_PROMPT},
@@ -118,6 +130,20 @@ class LLMService:
                         "Older conversation summary:\n"
                         f"{conversation_summary.strip()}\n\n"
                         "Use this only as background. Give priority to recent chat and current student message."
+                    ),
+                }
+            )
+
+        # ── Emotion-aware teaching directive ─────────────────────
+        if emotion_instruction.strip():
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Current student emotional state note:\n"
+                        f"{emotion_instruction.strip()}\n\n"
+                        "Adapt your teaching style based on this. "
+                        "Do not mention, label, or announce the student's emotion in your response."
                     ),
                 }
             )
@@ -227,6 +253,7 @@ class LLMService:
         recall_clarification_mode: bool = False,
         recall_clarification_question: str = "",
         fresh_teach_topic: str = "",
+        emotion_instruction: str = "",
     ) -> str:
         response = self.fg_client.chat(
             model=self.model,
@@ -238,6 +265,7 @@ class LLMService:
                 recall_clarification_mode=recall_clarification_mode,
                 recall_clarification_question=recall_clarification_question,
                 fresh_teach_topic=fresh_teach_topic,
+                emotion_instruction=emotion_instruction,
             ),
             stream=False,
             options={"temperature": self.temperature},
@@ -253,6 +281,7 @@ class LLMService:
         recall_clarification_mode: bool = False,
         recall_clarification_question: str = "",
         fresh_teach_topic: str = "",
+        emotion_instruction: str = "",
     ) -> Iterator[str]:
         if not self.enable_streaming:
             yield self.generate(
@@ -263,6 +292,7 @@ class LLMService:
                 recall_clarification_mode=recall_clarification_mode,
                 recall_clarification_question=recall_clarification_question,
                 fresh_teach_topic=fresh_teach_topic,
+                emotion_instruction=emotion_instruction,
             )
             return
 
@@ -278,6 +308,7 @@ class LLMService:
                     recall_clarification_mode=recall_clarification_mode,
                     recall_clarification_question=recall_clarification_question,
                     fresh_teach_topic=fresh_teach_topic,
+                    emotion_instruction=emotion_instruction,
                 ),
                 stream=True,
                 options={"temperature": self.temperature},
