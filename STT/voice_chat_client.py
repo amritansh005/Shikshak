@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import sys
+import os
 import threading
 import time
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import requests
@@ -26,8 +28,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── TTS client (optional — skipped gracefully if tts_service not running) ──
+_tts_client = None
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../tts_service"))
+    from tts_client import TTSClient
+    _tts_client = TTSClient(tts_service_url="http://127.0.0.1:5000", timeout=120)
+    logger.info("TTSClient loaded | url=http://127.0.0.1:5000")
+except Exception as _tts_err:
+    logger.info("TTSClient not available (%s) — running text-only mode", _tts_err)
 
-# Known Whisper hallucination phrases on silence/noise.
+
 HALLUCINATION_BLOCKLIST = {
     "bye", "bye bye", "goodbye", "thank you", "thanks",
     "thanks for watching", "thank you for watching",
@@ -45,8 +56,6 @@ class LiveTranscriptState:
         self.finalizing = False
         self.turn_generation = 0
         self.lock = threading.Lock()
-
-        # ── Emotion: per-frame VAD flags for prosody extraction ──
         self.is_speech_flags: List[bool] = []
 
     def reset(self) -> None:
@@ -64,7 +73,20 @@ def print_live(text: str) -> None:
     print(f"You (live): {clipped}", end="\r", flush=True)
 
 
-def send_to_teacher(session_id: str, text: str, emotion_data: Dict | None = None) -> str:
+def send_to_teacher(
+    session_id: str,
+    text: str,
+    emotion_data: Dict | None = None,
+) -> Dict:
+    """
+    POST to techer_llm /chat.
+
+    Returns:
+        {
+            "text":      str,           # teacher response text
+            "directive": dict | None,   # full TeachingDirective from EmotionStateService
+        }
+    """
     payload: Dict = {"message": text, "session_id": session_id}
     if emotion_data:
         payload["emotion"] = emotion_data
@@ -75,10 +97,18 @@ def send_to_teacher(session_id: str, text: str, emotion_data: Dict | None = None
         timeout=180,
     )
     response.raise_for_status()
-    return response.json().get("response", "").strip()
+    data = response.json()
+    return {
+        "text": data.get("response", "").strip(),
+        "directive": data.get("directive"),   # None if no emotion was sent
+    }
 
 
-def maybe_launch_partial_transcription(state: LiveTranscriptState, stt: STTService, turn_manager: TurnManager) -> None:
+def maybe_launch_partial_transcription(
+    state: LiveTranscriptState,
+    stt: STTService,
+    turn_manager: TurnManager,
+) -> None:
     with state.lock:
         if state.partial_in_flight or state.finalizing:
             return
@@ -108,7 +138,14 @@ def maybe_launch_partial_transcription(state: LiveTranscriptState, stt: STTServi
     threading.Thread(target=worker, daemon=True).start()
 
 
-def finalize_turn(state: LiveTranscriptState, stt: STTService, turn_manager: TurnManager, session_id: str, streamer: MicrophoneVADStreamer, ser_model: SERModel) -> None:
+def finalize_turn(
+    state: LiveTranscriptState,
+    stt: STTService,
+    turn_manager: TurnManager,
+    session_id: str,
+    streamer: MicrophoneVADStreamer,
+    ser_model: SERModel,
+) -> None:
     with state.lock:
         if state.finalizing:
             return
@@ -116,8 +153,6 @@ def finalize_turn(state: LiveTranscriptState, stt: STTService, turn_manager: Tur
         audio_bytes = state.turn.snapshot_audio()
         final_duration = state.turn.total_audio_seconds
         generation = state.turn_generation
-
-        # Snapshot the per-frame data for prosody extraction.
         pcm_frames_snapshot = list(state.turn.frames)
         is_speech_snapshot = list(state.is_speech_flags)
 
@@ -143,33 +178,27 @@ def finalize_turn(state: LiveTranscriptState, stt: STTService, turn_manager: Tur
             return
 
         # ── Hallucination filter ──────────────────────────────────
-        # Layered check to catch Whisper phantom outputs on near-silent audio.
-
         word_count = len(final_text.split())
         speech_frames = sum(1 for f in is_speech_snapshot if f)
         speech_duration_sec = speech_frames * settings.audio_frame_ms / 1000.0
-        silence_ratio = 1.0 - (speech_frames / len(is_speech_snapshot)) if is_speech_snapshot else 1.0
+        silence_ratio = (
+            1.0 - (speech_frames / len(is_speech_snapshot))
+            if is_speech_snapshot else 1.0
+        )
 
         is_hallucination = False
         hallucination_reason = ""
 
-        # Gate 1: Whisper itself thinks there's no speech.
         if avg_no_speech_prob > 0.6 and word_count <= 3:
             is_hallucination = True
             hallucination_reason = f"no_speech_prob={avg_no_speech_prob:.2f}"
-
-        # Gate 2: Mostly silence + very few words + tiny speech portion.
         elif silence_ratio > 0.55 and word_count <= 2 and speech_duration_sec < 0.5:
             is_hallucination = True
             hallucination_reason = f"silence_ratio={silence_ratio:.2f}, speech={speech_duration_sec:.1f}s"
-
-        # Gate 3: Known hallucination phrase + high silence.
         elif final_text.lower().strip().rstrip(".!?,") in HALLUCINATION_BLOCKLIST and silence_ratio > 0.45:
             is_hallucination = True
             hallucination_reason = f"blocklist_match, silence_ratio={silence_ratio:.2f}"
 
-        # Gate 4: Whisper repetition loop detection.
-        # If any single word repeats 3+ times consecutively, it's a hallucination loop.
         if not is_hallucination and word_count >= 3:
             words_lower = final_text.lower().split()
             max_repeat = 1
@@ -205,7 +234,6 @@ def finalize_turn(state: LiveTranscriptState, stt: STTService, turn_manager: Tur
             frame_ms=settings.audio_frame_ms,
         )
 
-        # SER model inference (emotion2vec on CPU).
         try:
             ser_audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             audio_emotion = ser_model.classify(ser_audio, sample_rate=settings.whisper_sample_rate)
@@ -221,15 +249,10 @@ def finalize_turn(state: LiveTranscriptState, stt: STTService, turn_manager: Tur
 
         logger.info(
             "Emotion extracted | text=%s (%.2f) | audio_ser=%s (%.2f) | speech_rate=%.1f sps | pause_ratio=%.2f | filled_pauses=%d | pitch=%.0f±%.0f Hz",
-            text_emotion["label"],
-            text_emotion["confidence"],
-            audio_emotion["label"],
-            audio_emotion["confidence"],
-            prosody.speech_rate_syllables_per_sec,
-            prosody.pause_ratio,
-            prosody.filled_pause_count,
-            prosody.pitch_mean_hz,
-            prosody.pitch_std_hz,
+            text_emotion["label"], text_emotion["confidence"],
+            audio_emotion["label"], audio_emotion["confidence"],
+            prosody.speech_rate_syllables_per_sec, prosody.pause_ratio,
+            prosody.filled_pause_count, prosody.pitch_mean_hz, prosody.pitch_std_hz,
         )
 
         print(" " * 160, end="\r")
@@ -240,8 +263,26 @@ def finalize_turn(state: LiveTranscriptState, stt: STTService, turn_manager: Tur
         )
         print()
 
-        teacher_text = send_to_teacher(session_id, final_text, emotion_data)
+        # ── Send to teacher, get response + directive ─────────────
+        result = send_to_teacher(session_id, final_text, emotion_data)
+        teacher_text = result["text"]
+        teacher_directive = result["directive"]  # window-smoothed TeachingDirective dict
+
         print(f"Teacher: {teacher_text}\n", flush=True)
+
+        # ── Speak teacher response with emotion-conditioned prosody ─
+        if _tts_client is not None and teacher_text:
+            if teacher_directive is not None:
+                # Use the full smoothed directive from EmotionStateService
+                _tts_client.speak_with_emotion(
+                    text=teacher_text,
+                    emotion_data=teacher_directive,
+                    session_id=session_id,
+                )
+            else:
+                # No emotion data was available (shouldn't happen in voice mode)
+                _tts_client.speak_neutral(teacher_text, session_id=session_id)
+
     finally:
         streamer.reset()
         state.reset()
@@ -254,15 +295,26 @@ def main() -> None:
     turn_manager = TurnManager()
     state = LiveTranscriptState()
 
-    # Load SER model (emotion2vec on CPU).
     print("Loading SER model...", end="", flush=True)
     ser_model = SERModel()
     print(" done.")
 
+    # Wait for TTS service with retries (it may still be loading the model)
+    tts_status = "disabled (service not running)"
+    if _tts_client is not None:
+        max_retries, delay = 30, 2          # up to 60 s
+        for attempt in range(1, max_retries + 1):
+            _tts_client.invalidate_availability_cache()
+            if _tts_client.is_available():
+                tts_status = "enabled"
+                break
+            print(f"\r  Waiting for TTS service (attempt {attempt}/{max_retries})...", end="", flush=True)
+            time.sleep(delay)
+        print()                             # newline after progress
     print("Voice chat streaming is ready.")
     print(f"Session ID: {session_id}")
-    print("Speak naturally. The system now tolerates short thinking pauses.")
-    print("Emotion detection is active (text + prosody + SER model).")
+    print(f"TTS: {tts_status}")
+    print("Speak naturally. Emotion detection is active (text + prosody + SER model).")
     print("Press Ctrl+C to stop.\n")
 
     try:
@@ -283,7 +335,6 @@ def main() -> None:
                         event.pcm_bytes,
                         is_speech=event.is_speech,
                     )
-                    # Track per-frame speech flag for prosody extraction.
                     state.is_speech_flags.append(event.is_speech)
                     decision = turn_manager.evaluate(state.turn)
 

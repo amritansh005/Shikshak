@@ -1,0 +1,54 @@
+# ── Python ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+
+# ── Virtual environments ──────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Environment variables (contains secrets/keys) ─────────────────
+.env
+
+# ── IDE / Editor ──────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS files ──────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Model weights & caches (downloaded at runtime) ────────────────
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.ckpt
+models/
+voices/*.wav
+
+# ── Audio output (generated at runtime) ───────────────────────────
+*.wav
+*.mp3
+*.ogg
+*.flac
+
+# ── Logs ──────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Jupyter / Notebooks ──────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Redis dump ────────────────────────────────────────────────────
+dump.rdb

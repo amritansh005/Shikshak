@@ -1,0 +1,36 @@
+# ── Core ─────────────────────────────────────────────────────────
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+requests
+redis
+
+# ── Qwen3-TTS (primary backend) ───────────────────────────────────
+# Official package for Qwen3-TTS-12Hz-0.6B-CustomVoice (~2.5 GB VRAM)
+# Install PyTorch for your CUDA version FIRST:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+qwen-tts
+
+# ── Prosody post-processing ───────────────────────────────────────
+# librosa: time-stretch + pitch-shift on top of Qwen3 output
+# Falls back to numpy-only rate control if not installed
+librosa
+soundfile
+
+# ── Audio playback (client-side, for tts_client.py) ──────────────
+sounddevice
+numpy
+
+# ── Kokoro-82M fallback (CPU, no GPU needed) ─────────────────────
+# Auto-used if Qwen3-TTS fails to load (no GPU / qwen-tts missing)
+# Install with: pip install kokoro
+# Optional — service starts without it (backend=none)
+
+# ── System TTS last-resort fallback in tts_client.py ─────────────
+# pip install pyttsx3
+# Optional — only used if both Qwen3-TTS and Kokoro are unavailable
+
+# ── Dev / testing ─────────────────────────────────────────────────
+# pytest
+# httpx  # for FastAPI TestClient async
