@@ -117,6 +117,7 @@ class LLMService:
         recall_clarification_question: str = "",
         fresh_teach_topic: str = "",
         emotion_instruction: str = "",
+        interruption_context: str = "",
     ) -> List[Dict[str, str]]:
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": AI_TEACHER_SYSTEM_PROMPT},
@@ -229,6 +230,27 @@ class LLMService:
                 if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
                     messages.append({"role": role, "content": content.strip()})
 
+        # ── Interruption: ask the LLM to identify the pending topic ──
+        if interruption_context.strip():
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "The student just interrupted your previous response. "
+                        "Here is what you were saying when interrupted:\n"
+                        f'"{interruption_context.strip()[:300]}"\n\n'
+                        "First, answer the student's current question normally.\n"
+                        "Then, on the VERY LAST LINE of your response, write exactly:\n"
+                        "[PENDING_TOPIC: <topic>]\n"
+                        "where <topic> is the specific subject you were teaching when interrupted "
+                        "(for example: Newton's first law of motion, quadratic equations, the French Revolution).\n"
+                        "If you were just greeting, making small-talk, or not teaching any specific topic, write:\n"
+                        "[PENDING_TOPIC: none]\n"
+                        "This line must always be the very last line. Do not add anything after it."
+                    ),
+                }
+            )
+
         messages.append({"role": "user", "content": user_message})
 
         logger.info(
@@ -254,6 +276,7 @@ class LLMService:
         recall_clarification_question: str = "",
         fresh_teach_topic: str = "",
         emotion_instruction: str = "",
+        interruption_context: str = "",
     ) -> str:
         response = self.fg_client.chat(
             model=self.model,
@@ -266,6 +289,7 @@ class LLMService:
                 recall_clarification_question=recall_clarification_question,
                 fresh_teach_topic=fresh_teach_topic,
                 emotion_instruction=emotion_instruction,
+                interruption_context=interruption_context,
             ),
             stream=False,
             options={"temperature": self.temperature},
@@ -282,6 +306,7 @@ class LLMService:
         recall_clarification_question: str = "",
         fresh_teach_topic: str = "",
         emotion_instruction: str = "",
+        interruption_context: str = "",
     ) -> Iterator[str]:
         if not self.enable_streaming:
             yield self.generate(
@@ -293,6 +318,7 @@ class LLMService:
                 recall_clarification_question=recall_clarification_question,
                 fresh_teach_topic=fresh_teach_topic,
                 emotion_instruction=emotion_instruction,
+                interruption_context=interruption_context,
             )
             return
 
@@ -309,6 +335,7 @@ class LLMService:
                     recall_clarification_question=recall_clarification_question,
                     fresh_teach_topic=fresh_teach_topic,
                     emotion_instruction=emotion_instruction,
+                    interruption_context=interruption_context,
                 ),
                 stream=True,
                 options={"temperature": self.temperature},

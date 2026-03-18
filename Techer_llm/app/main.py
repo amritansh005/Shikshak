@@ -1,4 +1,5 @@
 import logging
+import re
 import threading
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
@@ -107,6 +108,38 @@ def root() -> dict:
 def _build_resume_question(topic: str) -> str:
     topic = topic.strip().rstrip(".")
     return f"\n\nShould I continue with {topic}, or would you like to talk about something else?"
+
+
+# Regex to find the [PENDING_TOPIC: ...] tag the LLM appends on interruption turns.
+_PENDING_TOPIC_RE = re.compile(
+    r"\[PENDING_TOPIC:\s*(.+?)\]\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_and_strip_pending_topic(response: str) -> tuple:
+    """
+    Parse and remove the [PENDING_TOPIC: ...] tag from the LLM response.
+
+    Returns:
+        (clean_response, topic_or_none)
+
+    topic_or_none is:
+      - None  if no tag was found
+      - ""    if the LLM wrote [PENDING_TOPIC: none]
+      - str   the extracted topic otherwise
+    """
+    match = _PENDING_TOPIC_RE.search(response)
+    if not match:
+        return response, None
+
+    raw_topic = match.group(1).strip()
+    clean_response = response[: match.start()].rstrip()
+
+    if raw_topic.lower() in ("none", "n/a", "nil", "nothing", "no topic", "greeting", "small talk", "small-talk"):
+        return clean_response, ""
+
+    return clean_response, raw_topic
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -287,6 +320,11 @@ def chat(req: ChatRequest) -> ChatResponse:
     # ─────────────────────────────────────────────────────────────
     # 4) Normal LLM generation
     # ─────────────────────────────────────────────────────────────
+    # Detect interruption early so we can pass context to the LLM.
+    interruption_meta: Dict[str, Any] = req.interruption_meta or {}
+    was_interruption = bool(interruption_meta.get("interrupted"))
+    interrupted_assistant_text = (interruption_meta.get("interrupted_assistant_text") or "").strip()
+
     full_response = _llm.generate(
         user_message=llm_user_message,
         history_messages=history_messages,
@@ -296,6 +334,7 @@ def chat(req: ChatRequest) -> ChatResponse:
         recall_clarification_question=recall_clarification_question,
         fresh_teach_topic=fresh_teach_topic,
         emotion_instruction=emotion_instruction,
+        interruption_context=interrupted_assistant_text if was_interruption else "",
     )
 
     logger.info(
@@ -304,31 +343,38 @@ def chat(req: ChatRequest) -> ChatResponse:
     )
 
     # ─────────────────────────────────────────────────────────────
-    # 5) If this user turn interrupted TTS, store parent topic and
-    #    append resume question after answering the interruption.
+    # 5) If this user turn interrupted TTS, parse the LLM's
+    #    [PENDING_TOPIC: ...] tag to decide whether to store a
+    #    pending topic and append a resume question.
     # ─────────────────────────────────────────────────────────────
-    interruption_meta: Dict[str, Any] = req.interruption_meta or {}
-    was_interruption = bool(interruption_meta.get("interrupted"))
-
     if was_interruption:
-        inferred_topic = _interruption_state.infer_pending_topic(
-            current_user_message=user_input,
-            history_messages=history_messages,
-            conversation_summary=conversation_summary,
-            interrupted_assistant_text=(interruption_meta.get("interrupted_assistant_text") or ""),
-        )
+        full_response, llm_topic = _parse_and_strip_pending_topic(full_response)
 
-        if inferred_topic:
+        if llm_topic is None:
+            # LLM didn't produce the tag — fall back to not storing
+            # a pending topic (safe default: no resume question).
+            logger.info(
+                "No [PENDING_TOPIC] tag found in LLM response | session_id=%s",
+                session_id,
+            )
+        elif llm_topic == "":
+            # LLM explicitly said "none" — greeting / small-talk, skip.
+            logger.info(
+                "LLM indicated interrupted content was greeting/small-talk | session_id=%s",
+                session_id,
+            )
+        else:
+            # Real topic — store it and append resume question.
             _interruption_state.mark_pending_topic(
                 session_id=session_id,
-                topic=inferred_topic,
-                interrupted_assistant_text=(interruption_meta.get("interrupted_assistant_text") or ""),
+                topic=llm_topic,
+                interrupted_assistant_text=interrupted_assistant_text,
             )
-            full_response = full_response.rstrip() + _build_resume_question(inferred_topic)
+            full_response = full_response.rstrip() + _build_resume_question(llm_topic)
             logger.info(
-                "Pending topic marked from interruption | session_id=%s | topic=%r",
+                "Pending topic marked from LLM tag | session_id=%s | topic=%r",
                 session_id,
-                inferred_topic,
+                llm_topic,
             )
 
     # Save actual spoken/user-visible turn, not the synthetic llm_user_message.

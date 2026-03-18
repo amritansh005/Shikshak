@@ -3,10 +3,11 @@ from __future__ import annotations
 import io
 import logging
 import queue
+import re
 import threading
 import time
 import wave
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -171,6 +172,75 @@ class TTSClient:
                 self._volume_scale = 1.0
                 self._playback_started_at = 0.0
 
+    # ── Sentence-level chunking ────────────────────────────────────────────
+    # The TTS server rejects text over its max_length (default 2000 chars).
+    # We split long responses into sentence-sized chunks on the client side.
+    # This also improves perceived latency: the first sentence starts playing
+    # while subsequent chunks are still being synthesised.
+    _TTS_MAX_CHUNK_CHARS: int = 1800  # keep headroom below server's 2000
+
+    # Regex: split after sentence-ending punctuation followed by whitespace,
+    # or on double-newlines (markdown paragraph breaks).
+    _SENTENCE_SPLIT_RE = re.compile(
+        r'(?<=[.!?])\s+'        # sentence-ending punctuation + whitespace
+        r'|'
+        r'\n{2,}'               # paragraph break (markdown ### blocks etc.)
+    )
+
+    @staticmethod
+    def _split_into_chunks(text: str, max_chars: int) -> List[str]:
+        """
+        Split *text* into chunks that each fit within *max_chars*.
+
+        Strategy:
+        1. Split on sentence boundaries.
+        2. Greedily merge consecutive sentences into chunks up to *max_chars*.
+        3. If a single sentence exceeds *max_chars*, hard-split it on the
+           last space before the limit (unlikely with natural text but safe).
+        """
+        # Step 1: split into sentences
+        raw_parts = TTSClient._SENTENCE_SPLIT_RE.split(text)
+        sentences = [s.strip() for s in raw_parts if s.strip()]
+
+        if not sentences:
+            return [text] if text.strip() else []
+
+        # Step 2: merge greedily
+        chunks: List[str] = []
+        current = ""
+
+        for sentence in sentences:
+            # Handle an individual sentence that exceeds the limit
+            if len(sentence) > max_chars:
+                # Flush what we have so far
+                if current:
+                    chunks.append(current)
+                    current = ""
+                # Hard-split the oversized sentence
+                while len(sentence) > max_chars:
+                    split_at = sentence.rfind(" ", 0, max_chars)
+                    if split_at <= 0:
+                        split_at = max_chars
+                    chunks.append(sentence[:split_at].rstrip())
+                    sentence = sentence[split_at:].lstrip()
+                if sentence:
+                    current = sentence
+                continue
+
+            # Normal path: try appending to current chunk
+            candidate = f"{current} {sentence}".strip() if current else sentence
+            if len(candidate) <= max_chars:
+                current = candidate
+            else:
+                # current chunk is full — flush it, start a new one
+                chunks.append(current)
+                current = sentence
+
+        if current:
+            chunks.append(current)
+
+        return chunks
+
     def _synthesize_and_play(
         self,
         text: str,
@@ -184,49 +254,83 @@ class TTSClient:
                     self._fallback_speak(text)
                 return
 
+        # Split into sentence chunks that fit the server's max_length.
+        chunks = self._split_into_chunks(text, self._TTS_MAX_CHUNK_CHARS)
+        if not chunks:
+            return
+
+        # Track whether we've entered the playback state so the finally
+        # block knows whether to tear it down.
+        playback_entered = False
+
         try:
-            payload: Dict = {"text": text, "use_cache": True}
-            if self._voice:
-                payload["voice"] = self._voice
-            if emotion_payload:
-                payload["emotion"] = emotion_payload
-            if session_id:
-                payload["session_id"] = session_id
+            for idx, chunk_text in enumerate(chunks):
+                # After the first chunk has played, check _stop_event between
+                # chunks so an interruption during chunk N skips chunk N+1.
+                if playback_entered:
+                    with self._state_lock:
+                        if self._stop_event.is_set():
+                            logger.info(
+                                "TTS chunk loop aborted by interruption | played %d/%d chunks",
+                                idx, len(chunks),
+                            )
+                            break
 
-            resp = requests.post(
-                f"{self._url}/synthesize",
-                json=payload,
-                timeout=self._timeout,
-            )
-            resp.raise_for_status()
+                try:
+                    payload: Dict = {"text": chunk_text, "use_cache": True}
+                    if self._voice:
+                        payload["voice"] = self._voice
+                    if emotion_payload:
+                        payload["emotion"] = emotion_payload
+                    if session_id:
+                        payload["session_id"] = session_id
 
-            latency = resp.headers.get("X-TTS-Latency-Ms", "?")
-            state = resp.headers.get("X-TTS-Resolved-State", "?")
-            cache_hit = resp.headers.get("X-TTS-Cache-Hit", "false") == "true"
-            logger.info(
-                "TTS | latency=%sms | state=%s | cache=%s | chars=%d",
-                latency, state, cache_hit, len(text),
-            )
+                    resp = requests.post(
+                        f"{self._url}/synthesize",
+                        json=payload,
+                        timeout=self._timeout,
+                    )
+                    resp.raise_for_status()
 
-            self._set_playback_state(True, text)
-            try:
-                self._play_wav_bytes_streaming(resp.content)
-            finally:
+                    latency = resp.headers.get("X-TTS-Latency-Ms", "?")
+                    state = resp.headers.get("X-TTS-Resolved-State", "?")
+                    cache_hit = resp.headers.get("X-TTS-Cache-Hit", "false") == "true"
+                    logger.info(
+                        "TTS | chunk=%d/%d | latency=%sms | state=%s | cache=%s | chars=%d",
+                        idx + 1, len(chunks), latency, state, cache_hit, len(chunk_text),
+                    )
+
+                    # On the FIRST chunk, enter playback state right before
+                    # playing audio — NOT before the HTTP request.  This
+                    # matches the original timing: is_playing becomes True
+                    # only when we actually have audio to play, so the VAD
+                    # thread won't false-trigger on network-wait silence.
+                    # _stop_event.clear() happens inside _set_playback_state
+                    # which prevents a stale event from killing playback.
+                    if not playback_entered:
+                        self._set_playback_state(True, text)
+                        playback_entered = True
+
+                    # Play this chunk's audio (checks _stop_event per audio block)
+                    self._play_wav_bytes_streaming(resp.content)
+                    self._available = True
+
+                except requests.exceptions.ConnectionError:
+                    logger.warning("TTSClient | service unreachable — marking unavailable")
+                    self._available = False
+                    if self._fallback:
+                        remaining = " ".join(chunks[idx:])
+                        self._fallback_speak(remaining)
+                    break
+                except Exception as exc:
+                    logger.warning("TTSClient synthesis error on chunk %d | %s", idx + 1, exc)
+                    if self._fallback:
+                        remaining = " ".join(chunks[idx:])
+                        self._fallback_speak(remaining)
+                    break
+        finally:
+            if playback_entered:
                 self._set_playback_state(False, "")
-
-            self._available = True
-
-        except requests.exceptions.ConnectionError:
-            logger.warning("TTSClient | service unreachable — marking unavailable")
-            self._available = False
-            self._set_playback_state(False, "")
-            if self._fallback:
-                self._fallback_speak(text)
-        except Exception as exc:
-            logger.warning("TTSClient synthesis error | %s", exc)
-            self._set_playback_state(False, "")
-            if self._fallback:
-                self._fallback_speak(text)
 
     def _fallback_speak(self, text: str) -> None:
         if not _PYTTSX3_AVAILABLE:
