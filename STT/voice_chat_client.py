@@ -18,6 +18,7 @@ from app.services.emotion_service import (
     extract_prosody,
 )
 from app.services.realtime_vad import MicrophoneVADStreamer
+from app.services.speaker_verification import SpeakerVerificationService
 from app.services.stt_service import STTService
 from app.services.turn_manager import TurnManager, TurnState
 
@@ -219,6 +220,40 @@ def _tts_current_text() -> str:
     return ""
 
 
+def _tts_has_resume_audio() -> bool:
+    """Check if TTS has saved audio from a false interruption."""
+    if _tts_client is None:
+        return False
+    try:
+        return bool(getattr(_tts_client, "has_resume_audio", False))
+    except Exception:
+        return False
+
+
+def _tts_resume_playback() -> None:
+    """Resume TTS from where it was interrupted (false interruption recovery)."""
+    if _tts_client is None:
+        return
+    try:
+        resume_fn = getattr(_tts_client, "resume_playback", None)
+        if callable(resume_fn):
+            resume_fn()
+    except Exception:
+        logger.exception("Failed to resume TTS playback")
+
+
+def _tts_clear_resume_state() -> None:
+    """Discard saved resume audio (interruption was real)."""
+    if _tts_client is None:
+        return
+    try:
+        clear_fn = getattr(_tts_client, "clear_resume_state", None)
+        if callable(clear_fn):
+            clear_fn()
+    except Exception:
+        logger.exception("Failed to clear TTS resume state")
+
+
 class InterruptionState:
     """
     Tracks user barge-in while assistant TTS is active.
@@ -235,6 +270,7 @@ class InterruptionState:
         self.ducked: bool = False
         self.frames_seen: int = 0
         self.partial_confirm_in_flight: bool = False
+        self.vad_asr_delegated: bool = False  # Stage 3 fired ASR once
 
     def reset(self) -> None:
         self.active = False
@@ -247,6 +283,7 @@ class InterruptionState:
         self.ducked = False
         self.frames_seen = 0
         self.partial_confirm_in_flight = False
+        self.vad_asr_delegated = False
 
     def begin_candidate(self, tts_text: str) -> None:
         self.active = True
@@ -259,6 +296,7 @@ class InterruptionState:
         self.ducked = False
         self.frames_seen = 0
         self.partial_confirm_in_flight = False
+        self.vad_asr_delegated = False
 
 
 class LiveTranscriptState:
@@ -420,6 +458,10 @@ def _run_partial_interrupt_confirmation(
         finally:
             with state.lock:
                 state.interruption.partial_confirm_in_flight = False
+                # If ASR didn't confirm, allow Stage 3 to retry on next
+                # batch of speech frames (with fresh audio data).
+                if not state.interruption.confirmed:
+                    state.interruption.vad_asr_delegated = False
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -510,6 +552,12 @@ def maybe_handle_tts_interruption(
     # backchannel, require INTERRUPT_BACKCHANNEL_OVERRIDE_MS instead of
     # the normal confirm threshold.  This lets "hmm" / "okay" duck but not
     # kill playback unless the user keeps talking for a long time.
+    #
+    # Option 1 (noise protection): Instead of killing TTS on VAD duration
+    # alone, we require partial ASR to produce at least one real word.
+    # If no partial ASR has run yet at this point, fire one now.
+    # The actual kill happens inside _run_partial_interrupt_confirmation
+    # when it finds real words.  If no words are found, playback continues.
     effective_confirm = confirm_threshold
     if event.is_speech and candidate_ms >= confirm_threshold and not confirmed:
         # Check whether latest partial (if any) is only backchannel.
@@ -526,19 +574,18 @@ def maybe_handle_tts_interruption(
                 )
 
     if event.is_speech and candidate_ms >= effective_confirm and not confirmed:
+        # Instead of killing TTS immediately, require ASR confirmation.
+        # Use vad_asr_delegated flag to fire this only ONCE, not every frame.
         with state.lock:
-            if not state.interruption.confirmed:
-                state.interruption.confirmed = True
-                state.interruption.reason = "vad_duration"
-                state.interruption_meta_for_turn = {
-                    "interrupted": True,
-                    "reason": "vad_duration",
-                    "interrupted_assistant_text": tts_text_snapshot,
-                    "speech_ms_before_cancel": round(state.interruption.candidate_speech_ms, 1),
-                }
-        logger.info("Interruption confirmed via VAD duration | speech_ms=%.1f", candidate_ms)
-        _tts_stop_playback()
-        print("\n[Assistant interrupted by user]\n", flush=True)
+            already_delegated = state.interruption.vad_asr_delegated
+            if not already_delegated:
+                state.interruption.vad_asr_delegated = True
+        if not already_delegated:
+            _run_partial_interrupt_confirmation(state, stt, 0.0)
+            logger.info(
+                "VAD duration threshold reached, delegating to ASR confirmation | speech_ms=%.1f",
+                candidate_ms,
+            )
         return
 
 
@@ -549,6 +596,7 @@ def finalize_turn(
     session_id: str,
     streamer: MicrophoneVADStreamer,
     ser_model: SERModel,
+    speaker_verifier: Optional[SpeakerVerificationService] = None,
 ) -> None:
     with state.lock:
         if state.finalizing:
@@ -565,11 +613,43 @@ def finalize_turn(
             else None
         )
         tts_text_snapshot = state.interruption.tts_text_snapshot
+        had_interruption = state.interruption.confirmed
 
     try:
         if final_duration < settings.whisper_min_audio_ms / 1000.0:
             print("\nYou: [too short, ignored]\n", flush=True)
+            # Option 3: resume TTS if this was a false interruption
+            if had_interruption and _tts_has_resume_audio():
+                logger.info("False interruption detected (too short) — resuming TTS")
+                print("[Resuming teacher speech]\n", flush=True)
+                _tts_resume_playback()
             return
+
+        # ── Speaker verification gate ──────────────────────────────
+        # If a speaker profile is enrolled, check if this audio matches
+        # the student.  If not, discard the turn (background speaker).
+        if speaker_verifier is not None and speaker_verifier.is_enrolled:
+            sv_result = speaker_verifier.verify(
+                audio_int16=audio_bytes,
+                sample_rate=settings.whisper_sample_rate,
+            )
+            if not sv_result["is_student"]:
+                logger.info(
+                    "Speaker verification rejected | similarity=%.3f | threshold=%.2f | latency=%.0fms",
+                    sv_result["similarity"],
+                    sv_result["threshold"],
+                    sv_result["latency_ms"],
+                )
+                print(
+                    f"\nYou: [different speaker, ignored | similarity={sv_result['similarity']:.2f}]\n",
+                    flush=True,
+                )
+                # Resume TTS if this background speaker triggered a false interruption
+                if had_interruption and _tts_has_resume_audio():
+                    logger.info("Background speaker detected — resuming TTS")
+                    print("[Resuming teacher speech]\n", flush=True)
+                    _tts_resume_playback()
+                return
 
         result = stt.transcribe_bytes(audio_bytes, partial=False)
         final_text = result["text"].strip()
@@ -582,6 +662,11 @@ def finalize_turn(
 
         if not final_text:
             print("\nYou: [no speech recognized]\n", flush=True)
+            # Option 3: resume TTS if this was a false interruption
+            if had_interruption and _tts_has_resume_audio():
+                logger.info("False interruption detected (no speech) — resuming TTS")
+                print("[Resuming teacher speech]\n", flush=True)
+                _tts_resume_playback()
             return
 
         # Only create interruption_meta from final-text keywords when TTS was
@@ -643,7 +728,24 @@ def finalize_turn(
                 final_text, hallucination_reason, word_count, speech_duration_sec, avg_no_speech_prob,
             )
             print(f"\nYou: [{final_text}] [filtered: likely hallucination]\n", flush=True)
+            # Option 3: resume TTS if this was a false interruption
+            if had_interruption and _tts_has_resume_audio():
+                logger.info("False interruption detected (hallucination) — resuming TTS")
+                print("[Resuming teacher speech]\n", flush=True)
+                _tts_resume_playback()
             return
+
+        # ── Real speech confirmed — clear resume state, this is a genuine turn ──
+        _tts_clear_resume_state()
+
+        # ── Auto-enroll speaker on first real turn ─────────────────
+        if speaker_verifier is not None and not speaker_verifier.is_enrolled:
+            enrolled = speaker_verifier.enroll(
+                audio_int16=audio_bytes,
+                sample_rate=settings.whisper_sample_rate,
+            )
+            if enrolled:
+                print("  [Speaker profile enrolled]\n", flush=True)
 
         text_emotion = classify_text_emotion(final_text)
 
@@ -730,6 +832,21 @@ def main() -> None:
     ser_model = SERModel()
     print(" done.")
 
+    # ── Speaker Verification ──────────────────────────────────────
+    speaker_verifier: Optional[SpeakerVerificationService] = None
+    if settings.speaker_verification_enabled:
+        print("Loading speaker verification model...", end="", flush=True)
+        speaker_verifier = SpeakerVerificationService(
+            similarity_threshold=settings.speaker_verification_threshold,
+            auto_update_profile=settings.speaker_verification_auto_update,
+            device="cpu",
+        )
+        if speaker_verifier.is_available:
+            print(" done.")
+        else:
+            print(" skipped (resemblyzer not installed).")
+            speaker_verifier = None
+
     tts_status = "disabled (service not running)"
     if _tts_client is not None:
         max_retries, delay = 30, 2
@@ -749,6 +866,8 @@ def main() -> None:
     print("Voice chat streaming is ready.")
     print(f"Session ID: {session_id}")
     print(f"TTS: {tts_status}")
+    sv_status = "enabled (will enroll on first speech)" if speaker_verifier else "disabled"
+    print(f"Speaker verification: {sv_status}")
     print("Speak naturally. Emotion detection is active (text + prosody + SER model).")
     print("TTS-aware interruption is enabled (VAD + partial ASR + backchannel filter).")
     print(f"No-barge-in phase: {NO_BARGE_IN_MS}ms | Echo suppression: thresholds raised during TTS")
@@ -786,9 +905,16 @@ def main() -> None:
                 maybe_launch_partial_transcription(state, stt, turn_manager)
 
                 if decision.action == "finalize":
-                    finalize_turn(state, stt, turn_manager, session_id, streamer, ser_model)
+                    finalize_turn(state, stt, turn_manager, session_id, streamer, ser_model, speaker_verifier)
                 elif decision.action == "discard":
                     print("\nYou: [too short, ignored]\n", flush=True)
+                    # Option 3: resume TTS if this discard was from a false interruption
+                    with state.lock:
+                        had_interruption = state.interruption.confirmed
+                    if had_interruption and _tts_has_resume_audio():
+                        logger.info("False interruption detected (discard in main loop) — resuming TTS")
+                        print("[Resuming teacher speech]\n", flush=True)
+                        _tts_resume_playback()
                     _tts_restore_playback()
                     streamer.reset()
                     state.reset()

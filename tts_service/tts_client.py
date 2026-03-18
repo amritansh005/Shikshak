@@ -65,6 +65,16 @@ class TTSClient:
         # Used by voice_chat_client to implement the no-barge-in phase.
         self._playback_started_at: float = 0.0
 
+        # ── Resume-after-false-interruption state ────────────────────
+        # When playback is stopped by an interruption, we save the
+        # remaining audio so it can be resumed if the "interruption"
+        # turns out to be noise.
+        self._interrupted_audio: Optional[bytes] = None  # remaining WAV audio
+        self._interrupted_chunks: Optional[list] = None  # remaining text chunks
+        self._interrupted_emotion: Optional[Dict] = None
+        self._interrupted_session: Optional[str] = None
+        self._interrupted_full_text: str = ""
+
         logger.info("TTSClient initialised | url=%s", self._url)
 
     @property
@@ -102,6 +112,108 @@ class TTSClient:
     def restore_playback(self) -> None:
         with self._state_lock:
             self._volume_scale = 1.0
+
+    def clear_resume_state(self) -> None:
+        """Discard any saved audio from a previous interruption.
+        Called when the interruption was confirmed as real."""
+        with self._state_lock:
+            self._interrupted_audio = None
+            self._interrupted_chunks = None
+            self._interrupted_emotion = None
+            self._interrupted_session = None
+            self._interrupted_full_text = ""
+
+    @property
+    def has_resume_audio(self) -> bool:
+        """True if there is saved audio from a false interruption."""
+        with self._state_lock:
+            return (self._interrupted_audio is not None
+                    or self._interrupted_chunks is not None)
+
+    def resume_playback(self) -> None:
+        """Resume playback from where a false interruption stopped it.
+        Called from voice_chat_client when a turn is discarded as noise."""
+        with self._state_lock:
+            remaining_audio = self._interrupted_audio
+            remaining_chunks = self._interrupted_chunks
+            emotion = self._interrupted_emotion
+            session_id = self._interrupted_session
+            full_text = self._interrupted_full_text
+            # Clear so we don't resume twice
+            self._interrupted_audio = None
+            self._interrupted_chunks = None
+            self._interrupted_emotion = None
+            self._interrupted_session = None
+            self._interrupted_full_text = ""
+
+        if remaining_audio is not None:
+            # We have leftover audio bytes from mid-chunk — play them
+            logger.info("TTS resuming playback from interrupted audio")
+            self._set_playback_state(True, full_text)
+            try:
+                self._play_wav_bytes_streaming(remaining_audio)
+            finally:
+                # If there are also remaining chunks, continue with those
+                if remaining_chunks:
+                    self._play_remaining_chunks(
+                        remaining_chunks, emotion, session_id, full_text
+                    )
+                self._set_playback_state(False, "")
+        elif remaining_chunks:
+            # Interrupted between chunks — play remaining chunks
+            logger.info("TTS resuming playback from remaining chunks")
+            self._play_remaining_chunks(
+                remaining_chunks, emotion, session_id, full_text
+            )
+
+    def _play_remaining_chunks(
+        self,
+        chunks: list,
+        emotion_payload: Optional[Dict],
+        session_id: Optional[str],
+        full_text: str,
+    ) -> None:
+        """Synthesize and play remaining text chunks after resume."""
+        playback_entered = False
+        try:
+            for idx, chunk_text in enumerate(chunks):
+                with self._state_lock:
+                    if self._stop_event.is_set():
+                        logger.info(
+                            "TTS resume chunk loop aborted | played %d/%d",
+                            idx, len(chunks),
+                        )
+                        break
+
+                try:
+                    payload: Dict = {"text": chunk_text, "use_cache": True}
+                    if self._voice:
+                        payload["voice"] = self._voice
+                    if emotion_payload:
+                        payload["emotion"] = emotion_payload
+                    if session_id:
+                        payload["session_id"] = session_id
+
+                    resp = requests.post(
+                        f"{self._url}/synthesize",
+                        json=payload,
+                        timeout=self._timeout,
+                    )
+                    resp.raise_for_status()
+
+                    if not playback_entered:
+                        self._set_playback_state(True, full_text)
+                        playback_entered = True
+
+                    self._play_wav_bytes_streaming(resp.content)
+                    self._available = True
+
+                except Exception as exc:
+                    logger.warning("TTS resume chunk error | %s", exc)
+                    break
+        finally:
+            if playback_entered:
+                self._set_playback_state(False, "")
 
     def speak_with_emotion(
         self,
@@ -254,6 +366,9 @@ class TTSClient:
                     self._fallback_speak(text)
                 return
 
+        # New speech request — discard any old resume state
+        self.clear_resume_state()
+
         # Split into sentence chunks that fit the server's max_length.
         chunks = self._split_into_chunks(text, self._TTS_MAX_CHUNK_CHARS)
         if not chunks:
@@ -270,9 +385,16 @@ class TTSClient:
                 if playback_entered:
                     with self._state_lock:
                         if self._stop_event.is_set():
+                            # Save remaining chunks for possible resume
+                            remaining = chunks[idx:]
+                            if remaining:
+                                self._interrupted_chunks = remaining
+                                self._interrupted_emotion = emotion_payload
+                                self._interrupted_session = session_id
+                                self._interrupted_full_text = text
                             logger.info(
-                                "TTS chunk loop aborted by interruption | played %d/%d chunks",
-                                idx, len(chunks),
+                                "TTS chunk loop aborted by interruption | played %d/%d chunks | saved %d for resume",
+                                idx, len(chunks), len(remaining) if remaining else 0,
                             )
                             break
 
@@ -301,29 +423,41 @@ class TTSClient:
                     )
 
                     # On the FIRST chunk, enter playback state right before
-                    # playing audio — NOT before the HTTP request.  This
-                    # matches the original timing: is_playing becomes True
-                    # only when we actually have audio to play, so the VAD
-                    # thread won't false-trigger on network-wait silence.
-                    # _stop_event.clear() happens inside _set_playback_state
-                    # which prevents a stale event from killing playback.
+                    # playing audio — NOT before the HTTP request.
                     if not playback_entered:
                         self._set_playback_state(True, text)
+                        # Also save full text for resume context
+                        with self._state_lock:
+                            self._interrupted_full_text = text
+                            self._interrupted_emotion = emotion_payload
+                            self._interrupted_session = session_id
                         playback_entered = True
 
-                    # Play this chunk's audio (checks _stop_event per audio block)
+                    # Play this chunk's audio (checks _stop_event per audio block,
+                    # saves remaining audio to _interrupted_audio if stopped)
                     self._play_wav_bytes_streaming(resp.content)
+
+                    # If playback was stopped mid-chunk, save remaining chunks too
+                    with self._state_lock:
+                        if self._stop_event.is_set():
+                            remaining = chunks[idx + 1:]
+                            if remaining:
+                                self._interrupted_chunks = remaining
+                            break
+
                     self._available = True
 
                 except requests.exceptions.ConnectionError:
                     logger.warning("TTSClient | service unreachable — marking unavailable")
                     self._available = False
+                    self.clear_resume_state()
                     if self._fallback:
                         remaining = " ".join(chunks[idx:])
                         self._fallback_speak(remaining)
                     break
                 except Exception as exc:
                     logger.warning("TTSClient synthesis error on chunk %d | %s", idx + 1, exc)
+                    self.clear_resume_state()
                     if self._fallback:
                         remaining = " ".join(chunks[idx:])
                         self._fallback_speak(remaining)
@@ -378,6 +512,17 @@ class TTSClient:
                 while idx < total:
                     with self._state_lock:
                         if self._stop_event.is_set():
+                            # Save remaining audio for possible resume
+                            remaining = audio[idx:]
+                            if len(remaining) > 0:
+                                remaining_int16 = (remaining * 32767.0).astype(np.int16)
+                                remaining_buf = io.BytesIO()
+                                with wave.open(remaining_buf, "wb") as wf_out:
+                                    wf_out.setnchannels(n_channels)
+                                    wf_out.setsampwidth(2)
+                                    wf_out.setframerate(sample_rate)
+                                    wf_out.writeframes(remaining_int16.tobytes())
+                                self._interrupted_audio = remaining_buf.getvalue()
                             logger.info("TTS playback stopped early by interruption")
                             break
                         volume = self._volume_scale

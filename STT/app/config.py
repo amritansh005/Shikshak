@@ -44,5 +44,10 @@ class Settings:
 
     teacher_chat_url: str = os.getenv("VOICE_CHAT_TEACHER_URL", "http://127.0.0.1:8000/chat")
 
+    # ── Speaker Verification ──────────────────────────────────────
+    speaker_verification_enabled: bool = os.getenv("SPEAKER_VERIFICATION_ENABLED", "true").lower() == "true"
+    speaker_verification_threshold: float = float(os.getenv("SPEAKER_VERIFICATION_THRESHOLD", "0.75"))
+    speaker_verification_auto_update: bool = os.getenv("SPEAKER_VERIFICATION_AUTO_UPDATE", "true").lower() == "true"
+
 
 settings = Settings()
