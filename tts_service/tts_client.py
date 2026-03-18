@@ -4,8 +4,9 @@ import io
 import logging
 import queue
 import threading
+import time
 import wave
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import requests
 
@@ -17,6 +18,7 @@ try:
     _SD_AVAILABLE = True
 except ImportError:
     _SD_AVAILABLE = False
+    np = None  # type: ignore
 
 try:
     import pyttsx3
@@ -26,6 +28,15 @@ except ImportError:
 
 
 class TTSClient:
+    """
+    Queue-based TTS client with:
+    - cancellable playback
+    - basic duck/restore support
+    - current_text tracking
+    - playback state tracking
+    - playback_started_at timestamp for no-barge-in phase
+    """
+
     def __init__(
         self,
         tts_service_url: str = "http://127.0.0.1:5000",
@@ -40,9 +51,18 @@ class TTSClient:
         self._mute = False
         self._available: Optional[bool] = None
 
-        self._play_queue: queue.Queue = queue.Queue(maxsize=4)
+        self._play_queue: queue.Queue[Tuple[str, Optional[Dict], Optional[str]]] = queue.Queue(maxsize=4)
         self._play_thread = threading.Thread(target=self._play_worker, daemon=True)
         self._play_thread.start()
+
+        self._state_lock = threading.Lock()
+        self._is_playing: bool = False
+        self.current_text: str = ""
+        self._volume_scale: float = 1.0
+        self._stop_event = threading.Event()
+        # NEW: timestamp of when current playback started (monotonic clock).
+        # Used by voice_chat_client to implement the no-barge-in phase.
+        self._playback_started_at: float = 0.0
 
         logger.info("TTSClient initialised | url=%s", self._url)
 
@@ -54,24 +74,40 @@ class TTSClient:
     def mute(self, value: bool) -> None:
         self._mute = value
 
+    @property
+    def is_playing(self) -> bool:
+        with self._state_lock:
+            return self._is_playing
+
+    @property
+    def playback_started_at(self) -> float:
+        """Monotonic timestamp of when current playback began, or 0.0 if idle."""
+        with self._state_lock:
+            return self._playback_started_at
+
+    def stop_playback(self) -> None:
+        with self._state_lock:
+            self._stop_event.set()
+        try:
+            if _SD_AVAILABLE:
+                sd.stop()
+        except Exception as exc:
+            logger.debug("sd.stop failed | %s", exc)
+
+    def duck_playback(self, level: float = 0.22) -> None:
+        with self._state_lock:
+            self._volume_scale = max(0.05, min(level, 1.0))
+
+    def restore_playback(self) -> None:
+        with self._state_lock:
+            self._volume_scale = 1.0
+
     def speak_with_emotion(
         self,
         text: str,
         emotion_data: Optional[Dict] = None,
         session_id: Optional[str] = None,
     ) -> None:
-        """
-        Speak using the directive dict returned by techer_llm /chat.
-
-        emotion_data keys (from directive_dict in main.py):
-            smoothed_state, smoothed_confidence, trend,
-            secondary_state, secondary_confidence,
-            raw_text_label, raw_audio_label
-
-        This is passed directly as EmotionPayload to the TTS service —
-        no re-fusion needed since EmotionStateService already did the
-        full window-smoothed fusion.
-        """
         if self._mute or not text.strip():
             return
         self._enqueue(text, emotion_data, session_id)
@@ -93,16 +129,26 @@ class TTSClient:
     def invalidate_availability_cache(self) -> None:
         self._available = None
 
-    def _enqueue(self, text: str, emotion_payload: Optional[Dict], session_id: Optional[str]) -> None:
+    def _enqueue(
+        self,
+        text: str,
+        emotion_payload: Optional[Dict],
+        session_id: Optional[str],
+    ) -> None:
+        item = (text, emotion_payload, session_id)
+
         try:
-            self._play_queue.put_nowait((text, emotion_payload, session_id))
+            self._play_queue.put_nowait(item)
         except queue.Full:
-            logger.debug("TTSClient play queue full — dropping oldest item")
             try:
-                self._play_queue.get_nowait()
+                dropped = self._play_queue.get_nowait()
+                logger.warning(
+                    "TTSClient play queue full — dropped oldest item | text=%r",
+                    dropped[0][:80] if dropped else "?",
+                )
             except queue.Empty:
                 pass
-            self._play_queue.put_nowait((text, emotion_payload, session_id))
+            self._play_queue.put_nowait(item)
 
     def _play_worker(self) -> None:
         while True:
@@ -112,6 +158,19 @@ class TTSClient:
             except Exception as exc:
                 logger.warning("TTSClient play worker error | %s", exc)
 
+    def _set_playback_state(self, playing: bool, text: str = "") -> None:
+        with self._state_lock:
+            self._is_playing = playing
+            self.current_text = text
+            if playing:
+                self._stop_event.clear()
+                # NEW: record when playback started so the STT side can
+                # implement a no-barge-in phase.
+                self._playback_started_at = time.monotonic()
+            else:
+                self._volume_scale = 1.0
+                self._playback_started_at = 0.0
+
     def _synthesize_and_play(
         self,
         text: str,
@@ -119,7 +178,6 @@ class TTSClient:
         session_id: Optional[str],
     ) -> None:
         if not self.is_available():
-            # Re-check every call instead of staying permanently unavailable
             self.invalidate_availability_cache()
             if not self.is_available():
                 if self._fallback:
@@ -150,16 +208,23 @@ class TTSClient:
                 latency, state, cache_hit, len(text),
             )
 
-            _play_wav_bytes(resp.content)
+            self._set_playback_state(True, text)
+            try:
+                self._play_wav_bytes_streaming(resp.content)
+            finally:
+                self._set_playback_state(False, "")
+
             self._available = True
 
         except requests.exceptions.ConnectionError:
             logger.warning("TTSClient | service unreachable — marking unavailable")
             self._available = False
+            self._set_playback_state(False, "")
             if self._fallback:
                 self._fallback_speak(text)
         except Exception as exc:
             logger.warning("TTSClient synthesis error | %s", exc)
+            self._set_playback_state(False, "")
             if self._fallback:
                 self._fallback_speak(text)
 
@@ -173,24 +238,52 @@ class TTSClient:
         except Exception as exc:
             logger.debug("pyttsx3 fallback failed | %s", exc)
 
+    def _play_wav_bytes_streaming(self, wav_bytes: bytes) -> None:
+        if not _SD_AVAILABLE:
+            logger.debug("sounddevice not available — audio not played")
+            return
 
-def _play_wav_bytes(wav_bytes: bytes) -> None:
-    if not _SD_AVAILABLE:
-        logger.debug("sounddevice not available — audio not played")
-        return
-    try:
-        import numpy as np
-        buf = io.BytesIO(wav_bytes)
-        with wave.open(buf, "rb") as wf:
-            sample_rate = wf.getframerate()
-            n_channels = wf.getnchannels()
-            frames = wf.readframes(wf.getnframes())
+        try:
+            buf = io.BytesIO(wav_bytes)
+            with wave.open(buf, "rb") as wf:
+                sample_rate = wf.getframerate()
+                n_channels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                n_frames = wf.getnframes()
+                frames = wf.readframes(n_frames)
 
-        audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32767.0
-        if n_channels == 2:
-            audio = audio.reshape(-1, 2)
+            if sampwidth != 2:
+                raise ValueError(f"Unsupported WAV sample width: {sampwidth}")
 
-        sd.play(audio, samplerate=sample_rate)
-        sd.wait()
-    except Exception as exc:
-        logger.warning("Audio playback failed | %s", exc)
+            audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32767.0
+            if n_channels == 2:
+                audio = audio.reshape(-1, 2)
+
+            chunk_size = 2048
+            stream = sd.OutputStream(
+                samplerate=sample_rate,
+                channels=n_channels,
+                dtype="float32",
+                blocksize=chunk_size,
+            )
+
+            with stream:
+                total = len(audio)
+                idx = 0
+
+                while idx < total:
+                    with self._state_lock:
+                        if self._stop_event.is_set():
+                            logger.info("TTS playback stopped early by interruption")
+                            break
+                        volume = self._volume_scale
+
+                    chunk = audio[idx: idx + chunk_size]
+                    if volume != 1.0:
+                        chunk = chunk * volume
+
+                    stream.write(chunk)
+                    idx += chunk_size
+
+        except Exception as exc:
+            logger.warning("Audio playback failed | %s", exc)

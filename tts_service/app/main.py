@@ -117,7 +117,7 @@ class EmotionPayload(BaseModel):
 
 
 class SynthesizeRequest(BaseModel):
-    text: str = Field(..., min_length=1, max_length=2000)
+    text: str = Field(..., min_length=1, max_length=5000)
     session_id: Optional[str] = None
     voice: Optional[str] = Field(default=None, description="Voice name or path to .wav reference for cloning")
     emotion: Optional[EmotionPayload] = None

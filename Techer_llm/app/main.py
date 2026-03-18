@@ -1,7 +1,7 @@
 import logging
 import threading
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from app.services.chat_memory import ChatMemoryService
 from app.services.embedding_service import EmbeddingService
 from app.services.emotion_state_service import EmotionStateService
+from app.services.interruption_state_service import InterruptionStateService
 from app.services.llm_service import LLMService
 from app.services.recall_service import RecallService
 from app.services.summary_service import SummaryService
@@ -22,6 +23,7 @@ _summary_service: Optional[SummaryService] = None
 _embedding_service: Optional[EmbeddingService] = None
 _recall_service: Optional[RecallService] = None
 _emotion_state: Optional[EmotionStateService] = None
+_interruption_state: Optional[InterruptionStateService] = None
 _summary_lock = threading.Lock()
 
 
@@ -38,7 +40,8 @@ def _has_explicit_recall_cue(message: str) -> bool:
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    global _llm, _memory, _summary_service, _embedding_service, _recall_service, _emotion_state
+    global _llm, _memory, _summary_service, _embedding_service
+    global _recall_service, _emotion_state, _interruption_state
 
     logger.info("Initialising shared services...")
     _llm = LLMService()
@@ -51,6 +54,7 @@ async def lifespan(application: FastAPI):
         embedding_service=_embedding_service,
     )
     _emotion_state = EmotionStateService()
+    _interruption_state = InterruptionStateService()
 
     logger.info("Warming up models...")
     try:
@@ -61,10 +65,9 @@ async def lifespan(application: FastAPI):
         _llm.bg_client.chat(model=_llm.bg_model, messages=[{"role": "user", "content": "hi"}])
     except Exception as exc:
         logger.warning("Background model warmup failed | error=%s", exc)
+
     logger.info("Models warmed up. AI Teacher API is ready.")
-
     yield
-
     logger.info("Shutting down AI Teacher API.")
 
 
@@ -81,11 +84,12 @@ class ChatRequest(BaseModel):
     message: str
     session_id: str
     emotion: Optional[dict] = None
+    interruption_meta: Optional[dict] = None
 
 
 class ChatResponse(BaseModel):
     response: str
-    directive: Optional[dict] = None   # ← added: full TeachingDirective for TTS
+    directive: Optional[dict] = None
 
 
 @app.post("/internal/log")
@@ -98,6 +102,11 @@ def receive_log(record: LogRecord) -> dict:
 @app.get("/")
 def root() -> dict:
     return {"message": "AI Teacher API is running"}
+
+
+def _build_resume_question(topic: str) -> str:
+    topic = topic.strip().rstrip(".")
+    return f"\n\nShould I continue with {topic}, or would you like to talk about something else?"
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -113,11 +122,89 @@ def chat(req: ChatRequest) -> ChatResponse:
         session_id, user_input,
     )
 
+    # Pull context early.
     conversation_summary = _memory.get_conversation_summary_for_prompt(session_id)
     history_messages = _memory.get_recent_history_for_prompt(session_id)
 
+    # ─────────────────────────────────────────────────────────────
+    # 1) Interruption state / pending-topic control
+    # ─────────────────────────────────────────────────────────────
+    pending_state = _interruption_state.get_state(session_id)
+
+    llm_user_message = user_input
+    force_direct_response: Optional[str] = None
+
+    if pending_state.waiting_for_resume_decision and pending_state.pending_topic:
+        decision = _interruption_state.classify_resume_reply(user_input)
+
+        logger.info(
+            "Pending-topic resume decision | session_id=%s | pending_topic=%r | kind=%s | extracted_topic=%r",
+            session_id,
+            pending_state.pending_topic,
+            decision["kind"],
+            decision.get("topic"),
+        )
+
+        if decision["kind"] == "continue":
+            topic = pending_state.pending_topic
+            _interruption_state.clear(session_id)
+            llm_user_message = (
+                f"Please continue teaching this topic clearly and naturally from the beginning, "
+                f"not from the middle of an interrupted sentence: {topic}"
+            )
+
+        elif decision["kind"] == "decline":
+            _interruption_state.clear(session_id)
+            force_direct_response = "Okay — what would you like to talk about now?"
+
+        elif decision["kind"] == "new_topic":
+            _interruption_state.clear(session_id)
+            llm_user_message = decision["topic"] or user_input
+
+        else:
+            # Ambiguous reply while waiting for a resume decision.
+            # Ask again rather than relying on a small model to infer too much.
+            force_direct_response = (
+                f"I still have {pending_state.pending_topic} pending. "
+                f"Would you like me to continue with that, or would you like to switch to another topic?"
+            )
+
+    # If we already know the response, skip recall/LLM generation.
+    if force_direct_response is not None:
+        full_response = force_direct_response
+        directive_dict = None
+
+        # Save actual messages.
+        _memory.save_message(session_id=session_id, role="user", content=user_input)
+        _memory.save_message(session_id=session_id, role="assistant", content=full_response)
+        logger.info("Direct interruption-state response returned without LLM generation.")
+
+        _snap_session = session_id
+
+        def _update_summary_background() -> None:
+            if not _summary_lock.acquire(blocking=False):
+                logger.info("Summary update skipped — previous update still running.")
+                return
+            try:
+                logger.info("Older conversation summary update started.")
+                _memory.update_older_conversation_summary(
+                    session_id=_snap_session,
+                    summary_service=_summary_service,
+                )
+                logger.info("Older conversation summary update completed.")
+            except Exception as exc:
+                logger.warning("Older conversation summary update failed | error=%s", exc)
+            finally:
+                _summary_lock.release()
+
+        threading.Thread(target=_update_summary_background, daemon=True).start()
+        return ChatResponse(response=full_response, directive=directive_dict)
+
+    # ─────────────────────────────────────────────────────────────
+    # 2) Standard recall pipeline
+    # ─────────────────────────────────────────────────────────────
     recall_decision = _recall_service.get_recall_decision_for_turn(
-        user_message=user_input,
+        user_message=llm_user_message,
         history_messages=history_messages,
         conversation_summary=conversation_summary,
     )
@@ -127,7 +214,7 @@ def chat(req: ChatRequest) -> ChatResponse:
     recall_clarification_question = ""
     fresh_teach_topic = ""
 
-    explicit_recall_cue_present = _has_explicit_recall_cue(user_input)
+    explicit_recall_cue_present = _has_explicit_recall_cue(llm_user_message)
 
     if recall_decision.recall_needed and explicit_recall_cue_present:
         if (
@@ -153,7 +240,7 @@ def chat(req: ChatRequest) -> ChatResponse:
         else:
             recalled_memory = _recall_service.get_recalled_memory_for_turn(
                 session_id=session_id,
-                user_message=user_input,
+                user_message=llm_user_message,
                 history_messages=history_messages,
                 conversation_summary=conversation_summary,
             )
@@ -170,7 +257,9 @@ def chat(req: ChatRequest) -> ChatResponse:
         recall_clarification_mode,
     )
 
-    # ── Emotion state tracking ───────────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # 3) Emotion state tracking
+    # ─────────────────────────────────────────────────────────────
     emotion_instruction = ""
     directive = None
     directive_dict = None
@@ -185,7 +274,6 @@ def chat(req: ChatRequest) -> ChatResponse:
             directive.trend,
             len(emotion_instruction),
         )
-        # Build directive dict for TTS — uses window-smoothed values
         directive_dict = {
             "smoothed_state": directive.smoothed_state,
             "smoothed_confidence": directive.smoothed_confidence,
@@ -196,8 +284,11 @@ def chat(req: ChatRequest) -> ChatResponse:
             "raw_audio_label": directive.raw_audio_label,
         }
 
+    # ─────────────────────────────────────────────────────────────
+    # 4) Normal LLM generation
+    # ─────────────────────────────────────────────────────────────
     full_response = _llm.generate(
-        user_message=user_input,
+        user_message=llm_user_message,
         history_messages=history_messages,
         conversation_summary=conversation_summary,
         recalled_memory=recalled_memory,
@@ -212,6 +303,35 @@ def chat(req: ChatRequest) -> ChatResponse:
         len(full_response),
     )
 
+    # ─────────────────────────────────────────────────────────────
+    # 5) If this user turn interrupted TTS, store parent topic and
+    #    append resume question after answering the interruption.
+    # ─────────────────────────────────────────────────────────────
+    interruption_meta: Dict[str, Any] = req.interruption_meta or {}
+    was_interruption = bool(interruption_meta.get("interrupted"))
+
+    if was_interruption:
+        inferred_topic = _interruption_state.infer_pending_topic(
+            current_user_message=user_input,
+            history_messages=history_messages,
+            conversation_summary=conversation_summary,
+            interrupted_assistant_text=(interruption_meta.get("interrupted_assistant_text") or ""),
+        )
+
+        if inferred_topic:
+            _interruption_state.mark_pending_topic(
+                session_id=session_id,
+                topic=inferred_topic,
+                interrupted_assistant_text=(interruption_meta.get("interrupted_assistant_text") or ""),
+            )
+            full_response = full_response.rstrip() + _build_resume_question(inferred_topic)
+            logger.info(
+                "Pending topic marked from interruption | session_id=%s | topic=%r",
+                session_id,
+                inferred_topic,
+            )
+
+    # Save actual spoken/user-visible turn, not the synthetic llm_user_message.
     _memory.save_message(session_id=session_id, role="user", content=user_input)
     _memory.save_message(session_id=session_id, role="assistant", content=full_response)
     logger.info("Current turn messages saved to Redis/SQLite.")
