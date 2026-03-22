@@ -5,6 +5,10 @@ All heavy lifting (VAD, STT, interruption, TTS control, emotion) is done
 by the backend code in STT/voice_chat_client.py.  This worker just:
   1. Runs the backend event loop on a QThread
   2. Emits Qt signals so the GUI can display what's happening
+
+Option A+B: finalize_turn runs in a background thread so the event loop
+keeps processing VAD events — enabling real-time interruption even while
+the LLM is generating and TTS is speaking.
 """
 from __future__ import annotations
 
@@ -50,6 +54,7 @@ class PrintCapture:
     def __init__(self, worker: "LiveSessionWorker") -> None:
         self.worker = worker
         self._original_print = builtins.print
+        self.saw_teacher_reply = False
 
     def __enter__(self):
         builtins.print = self._capture_print
@@ -76,6 +81,7 @@ class PrintCapture:
                 self.worker.final_teacher_text.emit(teacher_text)
                 self.worker.live_teacher_text.emit(teacher_text)
                 self.worker.status_changed.emit("Speaking")
+                self.saw_teacher_reply = True
 
         elif text.strip().startswith("[text:"):
             # Emotion line like: [text: neutral | voice: sad (50%) | ...]
@@ -83,7 +89,6 @@ class PrintCapture:
 
         elif "[Assistant interrupted" in text:
             self.worker.note_changed.emit("Assistant interrupted by student")
-            self.worker.status_changed.emit("Interrupted")
 
         elif "Listening..." in text:
             self.worker.status_changed.emit("Listening")
@@ -91,6 +96,7 @@ class PrintCapture:
 
         elif "[Resuming teacher speech]" in text:
             self.worker.note_changed.emit("Resuming teacher speech")
+            self.worker.status_changed.emit("Speaking")
 
         elif "Speaker profile enrolled" in text:
             self.worker.note_changed.emit("Speaker profile enrolled")
@@ -207,13 +213,24 @@ class LiveSessionWorker(QObject):
 
             vcc.print_live = gui_print_live
 
-            # ── Main event loop — identical to voice_chat_client.main() ──
+            # ── Main event loop ──
+            # The event loop NEVER blocks. finalize_turn runs in a
+            # background thread (Option A) so VAD events keep flowing,
+            # enabling real-time interruption detection at all times.
             try:
                 for event in streamer.stream_events():
                     if self._stop_requested:
                         break
 
-                    # Interruption handling — uses the backend's working code
+                    # finalize_turn (bg thread) cannot safely call
+                    # streamer.reset() — do it here on the main thread.
+                    with state.lock:
+                        if state.needs_streamer_reset:
+                            state.needs_streamer_reset = False
+                            streamer.reset()
+
+                    # Interruption handling — runs on EVERY speech_frame,
+                    # even while finalize_turn is running in background
                     if event.event_type == "speech_frame":
                         vcc.maybe_handle_tts_interruption(
                             state=state,
@@ -247,17 +264,37 @@ class LiveSessionWorker(QObject):
                         if decision.action == "finalize":
                             self.status_changed.emit("Thinking")
 
-                            # Use PrintCapture to intercept backend's print output
-                            # and route it to GUI signals
-                            with PrintCapture(self):
-                                vcc.finalize_turn(
-                                    state, stt, turn_manager, session_id,
-                                    streamer, ser_model, speaker_verifier,
-                                )
+                            # ── Option A: run finalize_turn in background ──
+                            # PrintCapture intercepts print() from the bg
+                            # thread and emits GUI signals. The event loop
+                            # keeps running so VAD can detect interruptions.
+                            capture = PrintCapture(self)
+                            capture.__enter__()
 
-                            self.live_student_text.emit("")
-                            if not self._stop_requested:
-                                self.status_changed.emit("Listening")
+                            def _finalize_bg(cap=capture):
+                                try:
+                                    vcc.finalize_turn(
+                                        state, stt, turn_manager, session_id,
+                                        streamer, ser_model, speaker_verifier,
+                                    )
+                                except Exception as exc:
+                                    logger.exception("finalize_turn failed")
+                                    self.error_occurred.emit(str(exc))
+                                finally:
+                                    cap.__exit__(None, None, None)
+                                    self.live_student_text.emit("")
+                                    # Only revert to Listening if teacher
+                                    # didn't reply (filtered/hallucinated).
+                                    # If teacher replied, PrintCapture already
+                                    # set "Speaking".
+                                    if not self._stop_requested and not cap.saw_teacher_reply:
+                                        self.status_changed.emit("Listening")
+
+                            threading.Thread(
+                                target=_finalize_bg,
+                                daemon=True,
+                                name="finalize-turn",
+                            ).start()
 
                         elif decision.action == "discard":
                             self.note_changed.emit("Turn ignored: too short")

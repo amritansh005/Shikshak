@@ -312,6 +312,11 @@ class LiveTranscriptState:
         self.interruption = InterruptionState()
         self.interruption_meta_for_turn: Optional[Dict[str, Any]] = None
 
+        # Set by finalize_turn (bg thread) to request the main loop
+        # to call streamer.reset(). Cross-thread streamer.reset() is
+        # unsafe — it must run on the thread iterating stream_events().
+        self.needs_streamer_reset = False
+
     def reset(self) -> None:
         with self.lock:
             self.turn.reset()
@@ -327,6 +332,18 @@ class LiveTranscriptState:
 def print_live(text: str) -> None:
     clipped = text[:160]
     print(f"You (live): {clipped}", end="\r", flush=True)
+
+
+def _prepare_for_tts_resume(state: LiveTranscriptState) -> None:
+    """Clear finalizing and reset state BEFORE resuming TTS.
+
+    resume_playback() blocks until audio finishes.  If state.finalizing
+    remains True during that time, _run_partial_interrupt_confirmation
+    bails out immediately and the user cannot interrupt the resumed TTS.
+    """
+    with state.lock:
+        state.needs_streamer_reset = True
+    state.reset()                      # clears finalizing, turn, interruption
 
 
 def send_to_teacher(
@@ -507,8 +524,20 @@ def maybe_handle_tts_interruption(
     with state.lock:
         if not state.interruption.active:
             state.interruption.begin_candidate(tts_text=_tts_current_text())
+            # Ensure turn is active so audio frames get buffered.
+            # _run_partial_interrupt_confirmation needs audio from
+            # state.turn.snapshot_audio() to do ASR.
+            if not state.turn.speech_active:
+                state.turn.speech_active = True
+                state.turn.frames.clear()
+                state.turn.total_audio_seconds = 0.0
 
         state.interruption.frames_seen += 1
+
+        # Buffer the PCM frame into the turn for ASR confirmation
+        if event.pcm_bytes and state.turn.speech_active:
+            state.turn.frames.append(event.pcm_bytes)
+            state.turn.total_audio_seconds += float(settings.audio_frame_ms) / 1000.0
 
         if event.is_speech:
             state.interruption.candidate_speech_ms += float(settings.audio_frame_ms)
@@ -622,6 +651,7 @@ def finalize_turn(
             if had_interruption and _tts_has_resume_audio():
                 logger.info("False interruption detected (too short) — resuming TTS")
                 print("[Resuming teacher speech]\n", flush=True)
+                _prepare_for_tts_resume(state)
                 _tts_resume_playback()
             return
 
@@ -648,8 +678,9 @@ def finalize_turn(
                 if had_interruption and _tts_has_resume_audio():
                     logger.info("Background speaker detected — resuming TTS")
                     print("[Resuming teacher speech]\n", flush=True)
+                    _prepare_for_tts_resume(state)
                     _tts_resume_playback()
-                return
+                    return
 
         result = stt.transcribe_bytes(audio_bytes, partial=False)
         final_text = result["text"].strip()
@@ -666,6 +697,7 @@ def finalize_turn(
             if had_interruption and _tts_has_resume_audio():
                 logger.info("False interruption detected (no speech) — resuming TTS")
                 print("[Resuming teacher speech]\n", flush=True)
+                _prepare_for_tts_resume(state)
                 _tts_resume_playback()
             return
 
@@ -718,9 +750,18 @@ def finalize_turn(
                     max_repeat = max(max_repeat, current_repeat)
                 else:
                     current_repeat = 1
-            if max_repeat >= 3:
+            # A real hallucination loop is mostly repetition (e.g. "no no no no no").
+            # Real speech like "No no no I don't want to study motion" has meaningful
+            # content after the repetition.  Only flag as hallucination if:
+            #   - repeated 3+ times AND the sentence is SHORT (≤6 words), OR
+            #   - repeated 5+ times AND repetitions are >60% of total words
+            repeat_ratio = max_repeat / word_count if word_count > 0 else 0
+            if max_repeat >= 5 and repeat_ratio > 0.6:
                 is_hallucination = True
-                hallucination_reason = f"repetition_loop, word repeated {max_repeat}x"
+                hallucination_reason = f"repetition_loop, word repeated {max_repeat}x ({repeat_ratio:.0%} of text)"
+            elif max_repeat >= 3 and word_count <= 6:
+                is_hallucination = True
+                hallucination_reason = f"repetition_loop, word repeated {max_repeat}x in short utterance ({word_count} words)"
 
         if is_hallucination:
             logger.info(
@@ -732,6 +773,7 @@ def finalize_turn(
             if had_interruption and _tts_has_resume_audio():
                 logger.info("False interruption detected (hallucination) — resuming TTS")
                 print("[Resuming teacher speech]\n", flush=True)
+                _prepare_for_tts_resume(state)
                 _tts_resume_playback()
             return
 
@@ -817,7 +859,15 @@ def finalize_turn(
 
     finally:
         _tts_restore_playback()
-        streamer.reset()
+        # _prepare_for_tts_resume already did reset + set the flag
+        # for resume paths. For normal paths (teacher replied), we
+        # still need to signal the main loop.
+        with state.lock:
+            if not state.needs_streamer_reset:
+                state.needs_streamer_reset = True
+            # Only reset if not already reset by _prepare_for_tts_resume
+            if state.finalizing:
+                pass  # will be cleared by state.reset() below
         state.reset()
 
 
@@ -875,6 +925,12 @@ def main() -> None:
 
     try:
         for event in streamer.stream_events():
+            # Check if finalize_turn (bg thread) requested a reset
+            with state.lock:
+                if state.needs_streamer_reset:
+                    state.needs_streamer_reset = False
+                    streamer.reset()
+
             if event.event_type == "speech_frame":
                 maybe_handle_tts_interruption(
                     state=state,
@@ -914,10 +970,15 @@ def main() -> None:
                     if had_interruption and _tts_has_resume_audio():
                         logger.info("False interruption detected (discard in main loop) — resuming TTS")
                         print("[Resuming teacher speech]\n", flush=True)
+                        # Reset state BEFORE blocking resume so interruption
+                        # detection works during resumed playback
+                        state.reset()
+                        streamer.reset()
                         _tts_resume_playback()
-                    _tts_restore_playback()
-                    streamer.reset()
-                    state.reset()
+                    else:
+                        _tts_restore_playback()
+                        streamer.reset()
+                        state.reset()
                 else:
                     latest = state.turn.latest_partial()
                     if latest and decision.reason == "soft_pause_resume_window":
