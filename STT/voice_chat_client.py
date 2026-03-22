@@ -715,6 +715,39 @@ def finalize_turn(
                 "speech_ms_before_cancel": round(final_duration * 1000.0, 1),
             }
 
+        # ── Prepend partial ASR text from interruption confirmation ────
+        # The partial ASR that confirmed the interruption captured the
+        # beginning of the user's speech (e.g. "Let's try to").  The
+        # final transcription only contains audio recorded AFTER the
+        # interruption was confirmed (e.g. "third law of motion").
+        # Combine them so the LLM gets the full intent.
+        if interruption_meta and interruption_meta.get("reason", ""):
+            _ireason = interruption_meta["reason"]
+            _prefix_text = ""
+            if _ireason.startswith("partial_asr:"):
+                _prefix_text = _ireason[len("partial_asr:"):].strip().rstrip(".-,!?")
+            elif _ireason.startswith("keyword:"):
+                _prefix_text = _ireason[len("keyword:"):].strip().rstrip(".-,!?")
+
+            if _prefix_text:
+                # Only prepend if the final text doesn't already start
+                # with the same words (avoid duplication when ASR
+                # captured overlapping audio).
+                prefix_lower = _prefix_text.lower().split()
+                final_lower = final_text.lower().split()
+                already_present = (
+                    len(prefix_lower) > 0
+                    and len(final_lower) >= len(prefix_lower)
+                    and final_lower[:len(prefix_lower)] == prefix_lower
+                )
+                if not already_present and _prefix_text:
+                    combined = f"{_prefix_text} {final_text}"
+                    logger.info(
+                        "Prepended interruption partial ASR | prefix=%r | final=%r | combined=%r",
+                        _prefix_text, final_text, combined,
+                    )
+                    final_text = combined
+
         word_count = len(final_text.split())
         speech_frames = sum(1 for f in is_speech_snapshot if f)
         speech_duration_sec = speech_frames * settings.audio_frame_ms / 1000.0
