@@ -6,6 +6,8 @@ python voice_chat_client.py
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 pip install faster-whisper
 $env:Path = "C:\ffmpeg-8.0.1-essentials_build\bin;$env:Path"
+uvicorn app.main:app --host 0.0.0.0 --port 8001
+python shikshak_desktop.py
 
 Teacher LLM:
 cd "C:\Users\DELL\Desktop\Shikshak\Techer_llm"
@@ -50,3 +52,16 @@ huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --local-dir C:\Use
 pip install https://github.com/petermg/flash_attn_windows/releases/download/03/flash_attn-2.7.4.post1+cu128.torch251-cp310-cp310-win_amd64.whl
 uvicorn app.main:app --host 0.0.0.0 --port 5000 --workers 1
 pip install chatterbox-tts
+
+start frontend/shikshak_voice_ui.html
+
+
+conda create -n shikshak_gui python=3.10 -y
+conda activate shikshak_gui
+pip install PyQt6 sounddevice numpy requests python-dotenv webrtcvad-wheels faster-whisper funasr modelscope torch torchaudio resemblyzer
+pip install webrtcvad-wheels
+pip install PyQt6 sounddevice numpy requests python-dotenv faster-whisper funasr modelscope torch torchaudio resemblyzer
+cd C:\Users\DELL\Desktop\Shikshak\shikshak_pyqt6_desktop_app\desktop_teacher_app
+python main.py
+pip install av onnxruntime editdistance kaldiio librosa soundfile sentencepiece hydra-core omegaconf tensorboardx torch-complex pytorch-wpe jamo jaconv umap-learn aliyun-python-sdk-core aliyun-python-sdk-kms jmespath
+pip install ctranslate2 huggingface-hub tokenizers jieba oss2 filelock
