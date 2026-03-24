@@ -68,10 +68,6 @@ INTERRUPTION_KEYWORDS = {
 # ─────────────────────────────────────────────────────────────────────────────
 # Feature #2 — Backchannel classification
 # ─────────────────────────────────────────────────────────────────────────────
-# Words/phrases that are acknowledgments, not real interruptions.  When partial
-# ASR detects *only* backchannel words, duck stays active but confirmation is
-# suppressed.  A real interruption requires a non-backchannel word OR speech
-# exceeding INTERRUPT_BACKCHANNEL_OVERRIDE_MS.
 BACKCHANNEL_WORDS = {
     "hmm", "hm", "mm", "mmm", "mhm", "uh huh", "uhuh",
     "okay", "ok", "haan", "ha", "accha", "acha",
@@ -79,8 +75,6 @@ BACKCHANNEL_WORDS = {
     "oh", "ah", "aha",
 }
 
-# If speech is *only* backchannel but lasts this long, treat it as a real
-# interruption anyway — the user is probably trying to take the floor.
 INTERRUPT_BACKCHANNEL_OVERRIDE_MS = 800
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -91,28 +85,19 @@ INTERRUPT_CONFIRM_MS = 320
 INTERRUPT_SILENCE_RESET_MS = 500
 INTERRUPT_DUCK_LEVEL = 0.22
 
-# Partial ASR fires between duck and hard confirm thresholds (bug #1 fix).
 INTERRUPT_PARTIAL_ASR_MS = INTERRUPT_MIN_SPEECH_MS
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Feature #3 — Echo suppression via raised thresholds during TTS playback
 # ─────────────────────────────────────────────────────────────────────────────
-# When TTS is playing, the mic picks up speaker output.  Without real AEC, we
-# compensate by requiring significantly more speech evidence before ducking or
-# confirming.  These are the "during playback" equivalents of the normal
-# thresholds above.
-INTERRUPT_MIN_SPEECH_MS_DURING_TTS = 360     # 2× normal duck threshold
-INTERRUPT_CONFIRM_MS_DURING_TTS = 640         # 2× normal confirm threshold
-INTERRUPT_SILENCE_RESET_MS_DURING_TTS = 700   # slightly more patience
+INTERRUPT_MIN_SPEECH_MS_DURING_TTS = 360
+INTERRUPT_CONFIRM_MS_DURING_TTS = 640
+INTERRUPT_SILENCE_RESET_MS_DURING_TTS = 700
 INTERRUPT_PARTIAL_ASR_MS_DURING_TTS = INTERRUPT_MIN_SPEECH_MS_DURING_TTS
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Feature #1 — No-barge-in phase
 # ─────────────────────────────────────────────────────────────────────────────
-# For the first N ms of TTS playback, ignore all interruption candidates
-# entirely.  This prevents:
-#   - TTS audio leaking into the mic and triggering false VAD at playback start
-#   - accidental interruptions on the very first phonemes
 NO_BARGE_IN_MS = 400
 
 
@@ -133,13 +118,11 @@ def _is_only_backchannel(text: str) -> bool:
     """Return True if every word in *text* is a backchannel token."""
     normalized = _normalize_text(text)
     if not normalized:
-        return True  # empty → not a real interruption either
+        return True
 
-    # Check full phrase first (handles multi-word entries like "uh huh").
     if normalized in BACKCHANNEL_WORDS:
         return True
 
-    # Then check word-by-word.
     words = normalized.split()
     return all(w in BACKCHANNEL_WORDS for w in words)
 
@@ -270,7 +253,7 @@ class InterruptionState:
         self.ducked: bool = False
         self.frames_seen: int = 0
         self.partial_confirm_in_flight: bool = False
-        self.vad_asr_delegated: bool = False  # Stage 3 fired ASR once
+        self.vad_asr_delegated: bool = False
 
     def reset(self) -> None:
         self.active = False
@@ -317,6 +300,15 @@ class LiveTranscriptState:
         # unsafe — it must run on the thread iterating stream_events().
         self.needs_streamer_reset = False
 
+        # ── Interruption prefix that survives turn resets ──
+        # When an interruption is confirmed, the partial ASR text (e.g.
+        # "actually") is stored here.  If finalize_turn discards the
+        # current turn (too short, hallucination, etc.) or the turn gets
+        # reset before finalization, this prefix carries over to the NEXT
+        # turn so it gets prepended to the final transcription.
+        # Cleared only when successfully consumed by a valid turn.
+        self.pending_interruption_prefix: str = ""
+
     def reset(self) -> None:
         with self.lock:
             self.turn.reset()
@@ -327,6 +319,8 @@ class LiveTranscriptState:
             self.is_speech_flags.clear()
             self.interruption.reset()
             self.interruption_meta_for_turn = None
+            # NOTE: pending_interruption_prefix intentionally NOT cleared —
+            # it must survive resets so the next turn can use it.
 
 
 def print_live(text: str) -> None:
@@ -432,9 +426,6 @@ def _run_partial_interrupt_confirmation(
                 return
 
             # ── Feature #2: backchannel check ──
-            # If partial ASR produced only backchannel words, do NOT confirm
-            # the interruption.  The duck stays (volume is lowered) but playback
-            # continues.  This prevents "hmm", "okay", "haan" from killing TTS.
             if _is_only_backchannel(text):
                 logger.info(
                     "Partial ASR backchannel suppressed | text=%r | speech_ms=%.1f",
@@ -467,6 +458,18 @@ def _run_partial_interrupt_confirmation(
                     "speech_ms_before_cancel": round(state.interruption.candidate_speech_ms, 1),
                 }
 
+                # Save the prefix text so it survives state resets.
+                # If the current turn gets discarded (too short, hallucination)
+                # and the user continues speaking into a new turn, this prefix
+                # will be prepended to that next turn's transcription.
+                _prefix = ""
+                if reason.startswith("partial_asr:"):
+                    _prefix = reason[len("partial_asr:"):].strip().rstrip(".-,!?")
+                elif reason.startswith("keyword:"):
+                    _prefix = reason[len("keyword:"):].strip().rstrip(".-,!?")
+                if _prefix:
+                    state.pending_interruption_prefix = _prefix
+
             logger.info("Interruption confirmed via partial ASR | reason=%s", reason)
             _tts_stop_playback()
             print("\n[Assistant interrupted by user]\n", flush=True)
@@ -475,8 +478,6 @@ def _run_partial_interrupt_confirmation(
         finally:
             with state.lock:
                 state.interruption.partial_confirm_in_flight = False
-                # If ASR didn't confirm, allow Stage 3 to retry on next
-                # batch of speech frames (with fresh audio data).
                 if not state.interruption.confirmed:
                     state.interruption.vad_asr_delegated = False
 
@@ -500,10 +501,6 @@ def maybe_handle_tts_interruption(
         return
 
     # ── Re-check speech via VAD during TTS playback ──
-    # The is_speech flag on the event was set by the main VAD loop.
-    # During TTS playback, re-verify with the VAD to filter out TTS
-    # audio leaking into the mic.  With Silero VAD this is highly
-    # reliable; with webrtcvad fallback it's a best-effort check.
     effective_is_speech = event.is_speech
     if noise_gate is not None and event.is_speech and event.pcm_bytes:
         try:
@@ -511,20 +508,15 @@ def maybe_handle_tts_interruption(
             if not gate_says_speech:
                 effective_is_speech = False
         except Exception:
-            pass  # on error, trust the original is_speech flag
+            pass
 
-    # ── Feature #1: no-barge-in phase ──────────────────────────────────────
-    # For the first NO_BARGE_IN_MS of playback, completely ignore speech
-    # frames for interruption purposes.  This prevents TTS audio leaking
-    # into the mic from triggering a false barge-in on the opening phonemes.
+    # ── Feature #1: no-barge-in phase ──
     playback_age = _tts_playback_age_ms()
     if playback_age > 0 and playback_age < NO_BARGE_IN_MS:
         return
 
-    # ── Feature #3: pick thresholds based on whether TTS is active ─────────
-    # During playback the mic picks up speaker output.  Without real AEC we
-    # compensate by requiring more speech evidence before ducking/confirming.
-    tts_active = True  # we already checked _tts_is_playing() above
+    # ── Feature #3: pick thresholds based on whether TTS is active ──
+    tts_active = True
     if tts_active:
         duck_threshold = INTERRUPT_MIN_SPEECH_MS_DURING_TTS
         confirm_threshold = INTERRUPT_CONFIRM_MS_DURING_TTS
@@ -539,9 +531,6 @@ def maybe_handle_tts_interruption(
     with state.lock:
         if not state.interruption.active:
             state.interruption.begin_candidate(tts_text=_tts_current_text())
-            # Ensure turn is active so audio frames get buffered.
-            # _run_partial_interrupt_confirmation needs audio from
-            # state.turn.snapshot_audio() to do ASR.
             if not state.turn.speech_active:
                 state.turn.speech_active = True
                 state.turn.frames.clear()
@@ -549,7 +538,6 @@ def maybe_handle_tts_interruption(
 
         state.interruption.frames_seen += 1
 
-        # Buffer the PCM frame into the turn for ASR confirmation
         if event.pcm_bytes and state.turn.speech_active:
             state.turn.frames.append(event.pcm_bytes)
             state.turn.total_audio_seconds += float(settings.audio_frame_ms) / 1000.0
@@ -575,14 +563,14 @@ def maybe_handle_tts_interruption(
             _tts_restore_playback()
             return
 
-    # ── Stage 1: duck playback once speech exceeds the duck threshold ──
+    # ── Stage 1: duck ──
     if effective_is_speech and candidate_ms >= duck_threshold and not already_ducked:
         _tts_duck_playback(level=INTERRUPT_DUCK_LEVEL)
         with state.lock:
             state.interruption.ducked = True
         logger.info("TTS ducked due to possible interruption | speech_ms=%.1f", candidate_ms)
 
-    # ── Stage 2: in the duck→confirm window, try partial ASR confirmation ──
+    # ── Stage 2: partial ASR confirmation ──
     if (
         effective_is_speech
         and candidate_ms >= partial_asr_threshold
@@ -592,19 +580,8 @@ def maybe_handle_tts_interruption(
         _run_partial_interrupt_confirmation(state, stt, partial_asr_threshold)
 
     # ── Stage 3: hard VAD-duration confirmation (fallback) ──
-    # Feature #2 extension: if we have partial ASR text and it's *only*
-    # backchannel, require INTERRUPT_BACKCHANNEL_OVERRIDE_MS instead of
-    # the normal confirm threshold.  This lets "hmm" / "okay" duck but not
-    # kill playback unless the user keeps talking for a long time.
-    #
-    # Option 1 (noise protection): Instead of killing TTS on VAD duration
-    # alone, we require partial ASR to produce at least one real word.
-    # If no partial ASR has run yet at this point, fire one now.
-    # The actual kill happens inside _run_partial_interrupt_confirmation
-    # when it finds real words.  If no words are found, playback continues.
     effective_confirm = confirm_threshold
     if effective_is_speech and candidate_ms >= confirm_threshold and not confirmed:
-        # Check whether latest partial (if any) is only backchannel.
         with state.lock:
             latest_partial_text = (
                 state.turn.latest_partial() if state.turn.speech_active else ""
@@ -618,8 +595,6 @@ def maybe_handle_tts_interruption(
                 )
 
     if effective_is_speech and candidate_ms >= effective_confirm and not confirmed:
-        # Instead of killing TTS immediately, require ASR confirmation.
-        # Use vad_asr_delegated flag to fire this only ONCE, not every frame.
         with state.lock:
             already_delegated = state.interruption.vad_asr_delegated
             if not already_delegated:
@@ -670,9 +645,7 @@ def finalize_turn(
                 _tts_resume_playback()
             return
 
-        # ── Speaker verification gate ──────────────────────────────
-        # If a speaker profile is enrolled, check if this audio matches
-        # the student.  If not, discard the turn (background speaker).
+        # ── Speaker verification gate ──
         if speaker_verifier is not None and speaker_verifier.is_enrolled:
             sv_result = speaker_verifier.verify(
                 audio_int16=audio_bytes,
@@ -689,7 +662,6 @@ def finalize_turn(
                     f"\nYou: [different speaker, ignored | similarity={sv_result['similarity']:.2f}]\n",
                     flush=True,
                 )
-                # Resume TTS if this background speaker triggered a false interruption
                 if had_interruption and _tts_has_resume_audio():
                     logger.info("Background speaker detected — resuming TTS")
                     print("[Resuming teacher speech]\n", flush=True)
@@ -708,7 +680,6 @@ def finalize_turn(
 
         if not final_text:
             print("\nYou: [no speech recognized]\n", flush=True)
-            # Option 3: resume TTS if this was a false interruption
             if had_interruption and _tts_has_resume_audio():
                 logger.info("False interruption detected (no speech) — resuming TTS")
                 print("[Resuming teacher speech]\n", flush=True)
@@ -731,37 +702,47 @@ def finalize_turn(
             }
 
         # ── Prepend partial ASR text from interruption confirmation ────
-        # The partial ASR that confirmed the interruption captured the
-        # beginning of the user's speech (e.g. "Let's try to").  The
-        # final transcription only contains audio recorded AFTER the
-        # interruption was confirmed (e.g. "third law of motion").
-        # Combine them so the LLM gets the full intent.
+        # Two sources of prefix text:
+        #   1. interruption_meta from THIS turn (normal case — interruption
+        #      confirmed and finalized in the same turn).
+        #   2. pending_interruption_prefix from a PREVIOUS turn (the
+        #      interruption was confirmed, the turn got reset, and the
+        #      user's remaining speech became a new turn).
+        _prefix_text = ""
         if interruption_meta and interruption_meta.get("reason", ""):
             _ireason = interruption_meta["reason"]
-            _prefix_text = ""
             if _ireason.startswith("partial_asr:"):
                 _prefix_text = _ireason[len("partial_asr:"):].strip().rstrip(".-,!?")
             elif _ireason.startswith("keyword:"):
                 _prefix_text = _ireason[len("keyword:"):].strip().rstrip(".-,!?")
 
-            if _prefix_text:
-                # Only prepend if the final text doesn't already start
-                # with the same words (avoid duplication when ASR
-                # captured overlapping audio).
-                prefix_lower = _prefix_text.lower().split()
-                final_lower = final_text.lower().split()
-                already_present = (
-                    len(prefix_lower) > 0
-                    and len(final_lower) >= len(prefix_lower)
-                    and final_lower[:len(prefix_lower)] == prefix_lower
+        # Fall back to pending prefix from a previous turn's interruption
+        if not _prefix_text:
+            with state.lock:
+                _prefix_text = state.pending_interruption_prefix
+
+        if _prefix_text:
+            # Only prepend if the final text doesn't already start
+            # with the same words (avoid duplication when ASR
+            # captured overlapping audio).
+            prefix_lower = _prefix_text.lower().split()
+            final_lower = final_text.lower().split()
+            already_present = (
+                len(prefix_lower) > 0
+                and len(final_lower) >= len(prefix_lower)
+                and final_lower[:len(prefix_lower)] == prefix_lower
+            )
+            if not already_present and _prefix_text:
+                combined = f"{_prefix_text} {final_text}"
+                logger.info(
+                    "Prepended interruption partial ASR | prefix=%r | final=%r | combined=%r",
+                    _prefix_text, final_text, combined,
                 )
-                if not already_present and _prefix_text:
-                    combined = f"{_prefix_text} {final_text}"
-                    logger.info(
-                        "Prepended interruption partial ASR | prefix=%r | final=%r | combined=%r",
-                        _prefix_text, final_text, combined,
-                    )
-                    final_text = combined
+                final_text = combined
+
+        # Clear the pending prefix — it's been consumed (or wasn't needed)
+        with state.lock:
+            state.pending_interruption_prefix = ""
 
         word_count = len(final_text.split())
         speech_frames = sum(1 for f in is_speech_snapshot if f)
@@ -798,11 +779,6 @@ def finalize_turn(
                     max_repeat = max(max_repeat, current_repeat)
                 else:
                     current_repeat = 1
-            # A real hallucination loop is mostly repetition (e.g. "no no no no no").
-            # Real speech like "No no no I don't want to study motion" has meaningful
-            # content after the repetition.  Only flag as hallucination if:
-            #   - repeated 3+ times AND the sentence is SHORT (≤6 words), OR
-            #   - repeated 5+ times AND repetitions are >60% of total words
             repeat_ratio = max_repeat / word_count if word_count > 0 else 0
             if max_repeat >= 5 and repeat_ratio > 0.6:
                 is_hallucination = True
@@ -817,7 +793,6 @@ def finalize_turn(
                 final_text, hallucination_reason, word_count, speech_duration_sec, avg_no_speech_prob,
             )
             print(f"\nYou: [{final_text}] [filtered: likely hallucination]\n", flush=True)
-            # Option 3: resume TTS if this was a false interruption
             if had_interruption and _tts_has_resume_audio():
                 logger.info("False interruption detected (hallucination) — resuming TTS")
                 print("[Resuming teacher speech]\n", flush=True)
@@ -916,13 +891,9 @@ def finalize_turn(
 
     finally:
         _tts_restore_playback()
-        # _prepare_for_tts_resume already did reset + set the flag
-        # for resume paths. For normal paths (teacher replied), we
-        # still need to signal the main loop.
         with state.lock:
             if not state.needs_streamer_reset:
                 state.needs_streamer_reset = True
-            # Only reset if not already reset by _prepare_for_tts_resume
             if state.finalizing:
                 pass  # will be cleared by state.reset() below
         state.reset()
@@ -1024,14 +995,11 @@ def main() -> None:
                     finalize_turn(state, stt, turn_manager, session_id, streamer, ser_model, speaker_verifier)
                 elif decision.action == "discard":
                     print("\nYou: [too short, ignored]\n", flush=True)
-                    # Option 3: resume TTS if this discard was from a false interruption
                     with state.lock:
                         had_interruption = state.interruption.confirmed
                     if had_interruption and _tts_has_resume_audio():
                         logger.info("False interruption detected (discard in main loop) — resuming TTS")
                         print("[Resuming teacher speech]\n", flush=True)
-                        # Reset state BEFORE blocking resume so interruption
-                        # detection works during resumed playback
                         state.reset()
                         streamer.reset()
                         _tts_resume_playback()
