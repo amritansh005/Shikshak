@@ -236,6 +236,7 @@ class LiveSessionWorker(QObject):
                             state=state,
                             event=event,
                             stt=stt,
+                            noise_gate=streamer.noise_gate,
                         )
 
                     if event.event_type == "speech_start":

@@ -25,11 +25,11 @@ class STTService:
             settings.whisper_compute_type,
         )
 
-    def transcribe_bytes(self, audio_bytes: bytes, *, partial: bool = False) -> Dict[str, object]:
+    def transcribe_bytes(self, audio_bytes: bytes, *, partial: bool = False, context_prompt: str = "") -> Dict[str, object]:
         audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        return self.transcribe_array(audio, partial=partial)
+        return self.transcribe_array(audio, partial=partial, context_prompt=context_prompt)
 
-    def transcribe_array(self, audio: np.ndarray, *, partial: bool = False) -> Dict[str, object]:
+    def transcribe_array(self, audio: np.ndarray, *, partial: bool = False, context_prompt: str = "") -> Dict[str, object]:
         if audio.ndim != 1:
             audio = np.squeeze(audio)
 
@@ -54,7 +54,14 @@ class STTService:
                 temperature=0.0,
                 word_timestamps=False,
                 no_speech_threshold=0.6,
+                vad_filter=settings.whisper_vad_filter_final,
             )
+
+        # Dynamic context_prompt (from conversation) takes priority
+        # over the static .env base prompt.
+        prompt = context_prompt or settings.whisper_initial_prompt
+        if prompt:
+            kwargs["initial_prompt"] = prompt
 
         segments, info = self.model.transcribe(audio, **kwargs)
 

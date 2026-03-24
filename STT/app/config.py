@@ -19,11 +19,25 @@ class Settings:
     whisper_min_audio_ms: int = int(os.getenv("WHISPER_MIN_AUDIO_MS", "700"))
     whisper_sample_rate: int = int(os.getenv("WHISPER_SAMPLE_RATE", "16000"))
     whisper_channels: int = int(os.getenv("WHISPER_CHANNELS", "1"))
+    whisper_initial_prompt: str = os.getenv(
+        "WHISPER_INITIAL_PROMPT",
+        "education, learning, teaching, explain, understand, example, "
+        "actually, basically, question, answer, practice, concept",
+    )
+    whisper_vad_filter_final: bool = os.getenv("WHISPER_VAD_FILTER_FINAL", "true").lower() == "true"
 
     vad_mode: int = int(os.getenv("VAD_MODE", "2"))
     audio_frame_ms: int = int(os.getenv("AUDIO_FRAME_MS", "30"))
     vad_pre_roll_ms: int = int(os.getenv("VAD_PRE_ROLL_MS", "300"))
     vad_start_trigger_ms: int = int(os.getenv("VAD_START_TRIGGER_MS", "90"))
+
+    # ── Silero VAD thresholds ──────────────────────────────────────
+    # Speech probability above this → speech starts (stricter)
+    vad_silero_speech_threshold: float = float(os.getenv("VAD_SILERO_SPEECH_THRESHOLD", "0.5"))
+    # Speech probability below this → speech ends (looser, avoids mid-word chop)
+    vad_silero_silence_threshold: float = float(os.getenv("VAD_SILERO_SILENCE_THRESHOLD", "0.35"))
+    # Safety: if VAD says unbroken speech for this long, force reset (likely noise)
+    vad_max_continuous_speech_ms: int = int(os.getenv("VAD_MAX_CONTINUOUS_SPEECH_MS", "9000"))
 
     partial_min_audio_ms: int = int(os.getenv("PARTIAL_MIN_AUDIO_MS", "700"))
     partial_decode_interval_ms: int = int(os.getenv("PARTIAL_DECODE_INTERVAL_MS", "500"))

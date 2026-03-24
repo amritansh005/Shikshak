@@ -487,6 +487,7 @@ def maybe_handle_tts_interruption(
     state: LiveTranscriptState,
     event: Any,
     stt: STTService,
+    noise_gate: Any = None,
 ) -> None:
     if event.event_type != "speech_frame" or not event.pcm_bytes:
         return
@@ -497,6 +498,20 @@ def maybe_handle_tts_interruption(
                 state.interruption.reset()
         _tts_restore_playback()
         return
+
+    # ── Re-check speech via VAD during TTS playback ──
+    # The is_speech flag on the event was set by the main VAD loop.
+    # During TTS playback, re-verify with the VAD to filter out TTS
+    # audio leaking into the mic.  With Silero VAD this is highly
+    # reliable; with webrtcvad fallback it's a best-effort check.
+    effective_is_speech = event.is_speech
+    if noise_gate is not None and event.is_speech and event.pcm_bytes:
+        try:
+            gate_says_speech = noise_gate.is_speech(event.pcm_bytes)
+            if not gate_says_speech:
+                effective_is_speech = False
+        except Exception:
+            pass  # on error, trust the original is_speech flag
 
     # ── Feature #1: no-barge-in phase ──────────────────────────────────────
     # For the first NO_BARGE_IN_MS of playback, completely ignore speech
@@ -539,7 +554,7 @@ def maybe_handle_tts_interruption(
             state.turn.frames.append(event.pcm_bytes)
             state.turn.total_audio_seconds += float(settings.audio_frame_ms) / 1000.0
 
-        if event.is_speech:
+        if effective_is_speech:
             state.interruption.candidate_speech_ms += float(settings.audio_frame_ms)
             state.interruption.trailing_silence_ms = 0.0
         else:
@@ -561,7 +576,7 @@ def maybe_handle_tts_interruption(
             return
 
     # ── Stage 1: duck playback once speech exceeds the duck threshold ──
-    if event.is_speech and candidate_ms >= duck_threshold and not already_ducked:
+    if effective_is_speech and candidate_ms >= duck_threshold and not already_ducked:
         _tts_duck_playback(level=INTERRUPT_DUCK_LEVEL)
         with state.lock:
             state.interruption.ducked = True
@@ -569,7 +584,7 @@ def maybe_handle_tts_interruption(
 
     # ── Stage 2: in the duck→confirm window, try partial ASR confirmation ──
     if (
-        event.is_speech
+        effective_is_speech
         and candidate_ms >= partial_asr_threshold
         and candidate_ms < confirm_threshold
         and not confirmed
@@ -588,7 +603,7 @@ def maybe_handle_tts_interruption(
     # The actual kill happens inside _run_partial_interrupt_confirmation
     # when it finds real words.  If no words are found, playback continues.
     effective_confirm = confirm_threshold
-    if event.is_speech and candidate_ms >= confirm_threshold and not confirmed:
+    if effective_is_speech and candidate_ms >= confirm_threshold and not confirmed:
         # Check whether latest partial (if any) is only backchannel.
         with state.lock:
             latest_partial_text = (
@@ -602,7 +617,7 @@ def maybe_handle_tts_interruption(
                     latest_partial_text, candidate_ms, effective_confirm,
                 )
 
-    if event.is_speech and candidate_ms >= effective_confirm and not confirmed:
+    if effective_is_speech and candidate_ms >= effective_confirm and not confirmed:
         # Instead of killing TTS immediately, require ASR confirmation.
         # Use vad_asr_delegated flag to fire this only ONCE, not every frame.
         with state.lock:
@@ -815,12 +830,21 @@ def finalize_turn(
 
         # ── Auto-enroll speaker on first real turn ─────────────────
         if speaker_verifier is not None and not speaker_verifier.is_enrolled:
-            enrolled = speaker_verifier.enroll(
-                audio_int16=audio_bytes,
-                sample_rate=settings.whisper_sample_rate,
-            )
-            if enrolled:
-                print("  [Speaker profile enrolled]\n", flush=True)
+            import builtins
+            _saved_print = builtins.print
+            try:
+                builtins.print = __builtins__["print"] if isinstance(__builtins__, dict) else getattr(__builtins__, "print", _saved_print)
+            except Exception:
+                pass
+            try:
+                enrolled = speaker_verifier.enroll(
+                    audio_int16=audio_bytes,
+                    sample_rate=settings.whisper_sample_rate,
+                )
+                if enrolled:
+                    _saved_print("  [Speaker profile enrolled]\n", flush=True)
+            finally:
+                builtins.print = _saved_print
 
         text_emotion = classify_text_emotion(final_text)
 
@@ -951,6 +975,8 @@ def main() -> None:
     print(f"TTS: {tts_status}")
     sv_status = "enabled (will enroll on first speech)" if speaker_verifier else "disabled"
     print(f"Speaker verification: {sv_status}")
+    vad_type = "Silero VAD (neural)" if hasattr(streamer.vad, '_model') else "webrtcvad (fallback)"
+    print(f"VAD: {vad_type}")
     print("Speak naturally. Emotion detection is active (text + prosody + SER model).")
     print("TTS-aware interruption is enabled (VAD + partial ASR + backchannel filter).")
     print(f"No-barge-in phase: {NO_BARGE_IN_MS}ms | Echo suppression: thresholds raised during TTS")
@@ -969,6 +995,7 @@ def main() -> None:
                     state=state,
                     event=event,
                     stt=stt,
+                    noise_gate=streamer.noise_gate,
                 )
 
             if event.event_type == "speech_start":
