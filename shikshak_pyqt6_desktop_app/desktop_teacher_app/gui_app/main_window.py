@@ -379,6 +379,8 @@ class MainWindow(QMainWindow):
         self.worker_thread: QThread | None = None
         self.worker: LiveSessionWorker | None = None
         self._session_active = False
+        self._pending_thread: QThread | None = None
+        self._pending_worker: LiveSessionWorker | None = None
 
         self._build_ui()
         self._preload_progress.connect(self._on_preload_progress)
@@ -589,21 +591,79 @@ class MainWindow(QMainWindow):
             self.worker.stop()
         self._session_active = False
         self._set_connection(False)
-
-    def _on_finished(self):
-        self._session_active = False
+        # Immediately reset UI to idle state so the user sees
+        # "TAP TO BEGIN" right away, without waiting for the
+        # worker thread to finish.
         self._set_state_display("idle")
-        self._set_connection(False)
         self.live_student_label.setText("")
         self.live_teacher_label.setText("")
-        if self.worker_thread is not None:
-            self.worker_thread.wait(2000)
+        # Move the old thread/worker to a pending reference so
+        # _on_finished can clean it up asynchronously.  This lets
+        # start_session create a fresh thread immediately without
+        # blocking the GUI thread waiting for the old one to die.
+        # IMPORTANT: disconnect all signals from the old worker first,
+        # otherwise late signals (like "Stopped") from the dying
+        # worker will interfere with a newly started session's UI.
+        if self.worker is not None:
+            try:
+                self.worker.status_changed.disconnect()
+                self.worker.note_changed.disconnect()
+                self.worker.live_student_text.disconnect()
+                self.worker.final_student_text.disconnect()
+                self.worker.live_teacher_text.disconnect()
+                self.worker.final_teacher_text.disconnect()
+                self.worker.emotion_changed.disconnect()
+                self.worker.session_ready.disconnect()
+                self.worker.health_report.disconnect()
+                self.worker.error_occurred.disconnect()
+                # Keep finished connected so _on_finished can clean up
+            except Exception:
+                pass
+        self._pending_thread = self.worker_thread
+        self._pending_worker = self.worker
         self.worker_thread = None
         self.worker = None
-        self.status_strip.set_note("Session ended")
+        # The finalize_turn background thread may still be waiting
+        # for an LLM response and will call TTS *after* our
+        # stop_playback() above.  Schedule repeated TTS kills to
+        # catch any late playback starts — but only if no new
+        # session has started in the meantime.
+        import voice_chat_client as vcc
+        for delay_ms in (100, 500, 1500, 3000):
+            QTimer.singleShot(delay_ms, lambda: (
+                vcc._tts_stop_playback() if not self._session_active else None
+            ))
+
+    def _on_finished(self):
+        # This signal can fire from EITHER the current worker thread
+        # or a pending (old) worker thread that was moved aside by
+        # stop_session.  We must only clean up the pending thread
+        # and NOT touch the active session if a new one has started.
+        if self._pending_thread is not None:
+            self._pending_thread.wait(2000)
+            self._pending_thread = None
+            self._pending_worker = None
+
+        # Only reset UI / active state if no new session has started.
+        # If _session_active is True, a new session is already running
+        # and we must not interfere.
+        if not self._session_active:
+            self._set_state_display("idle")
+            self._set_connection(False)
+            self.live_student_label.setText("")
+            self.live_teacher_label.setText("")
+            if self.worker_thread is not None:
+                self.worker_thread.wait(2000)
+                self.worker_thread = None
+                self.worker = None
+            self.status_strip.set_note("Session ended")
 
     # ── Signal handlers ────────────────────────────────────────
     def _on_status_changed(self, status: str):
+        # Ignore status updates from the worker after the user has
+        # clicked stop — the UI is already showing "TAP TO BEGIN".
+        if not self._session_active:
+            return
         self._set_state_display(status)
 
     def _on_live_student(self, text: str):
@@ -631,4 +691,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.stop_session()
+        # On app exit, wait for any threads to finish so we don't
+        # get "QThread destroyed while running" warnings.
+        if self._pending_thread is not None:
+            self._pending_thread.quit()
+            self._pending_thread.wait(3000)
+        if self.worker_thread is not None:
+            self.worker_thread.quit()
+            self.worker_thread.wait(3000)
         super().closeEvent(event)

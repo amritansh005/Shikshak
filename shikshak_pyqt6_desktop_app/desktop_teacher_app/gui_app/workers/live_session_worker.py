@@ -14,13 +14,10 @@ from __future__ import annotations
 
 import builtins
 import logging
-import re
 import threading
-import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
-import numpy as np
 import requests
 from PyQt6.QtCore import QObject, pyqtSignal
 
@@ -29,10 +26,10 @@ from gui_app.bootstrap import setup_project_imports
 setup_project_imports()
 
 from app.config import settings  # type: ignore
-from app.services.emotion_service import SERModel, classify_text_emotion, extract_prosody  # type: ignore
+from app.services.emotion_service import SERModel  # type: ignore
 from app.services.realtime_vad import MicrophoneVADStreamer  # type: ignore
 from app.services.stt_service import STTService  # type: ignore
-from app.services.turn_manager import TurnManager, TurnState  # type: ignore
+from app.services.turn_manager import TurnManager  # type: ignore
 
 try:
     from app.services.speaker_verification import SpeakerVerificationService  # type: ignore
@@ -44,6 +41,35 @@ import voice_chat_client as vcc  # type: ignore
 
 logger = logging.getLogger(__name__)
 
+# -------------------------------------------------------------------------
+# SAFE GLOBAL PRINT CAPTURE DISPATCH
+# -------------------------------------------------------------------------
+# Why this exists:
+# The old version monkey-patched builtins.print with a bound instance method:
+#     builtins.print = self._capture_print
+# That can break some code paths which expect the capture callable to exist
+# at module scope, causing warnings like:
+#     module 'gui_app.workers.live_session_worker' has no attribute '_capture_print'
+#
+# To preserve all current behavior without changing functionality, we route
+# print() through a module-level dispatcher and let the active PrintCapture
+# instance handle the text.
+# -------------------------------------------------------------------------
+_ORIGINAL_PRINT = builtins.print
+_ACTIVE_PRINT_CAPTURE: Optional["PrintCapture"] = None
+_PRINT_CAPTURE_LOCK = threading.RLock()
+
+
+def _capture_print(*args, **kwargs) -> None:
+    capture: Optional["PrintCapture"]
+    with _PRINT_CAPTURE_LOCK:
+        capture = _ACTIVE_PRINT_CAPTURE
+
+    if capture is not None:
+        capture.handle_print(*args, **kwargs)
+    else:
+        _ORIGINAL_PRINT(*args, **kwargs)
+
 
 class PrintCapture:
     """
@@ -53,21 +79,28 @@ class PrintCapture:
 
     def __init__(self, worker: "LiveSessionWorker") -> None:
         self.worker = worker
-        self._original_print = builtins.print
         self.saw_teacher_reply = False
         self.saw_tts_resume = False
 
     def __enter__(self):
-        builtins.print = self._capture_print
+        global _ACTIVE_PRINT_CAPTURE
+        with _PRINT_CAPTURE_LOCK:
+            _ACTIVE_PRINT_CAPTURE = self
+            builtins.print = _capture_print
         return self
 
     def __exit__(self, *args):
-        builtins.print = self._original_print
+        global _ACTIVE_PRINT_CAPTURE
+        with _PRINT_CAPTURE_LOCK:
+            if _ACTIVE_PRINT_CAPTURE is self:
+                _ACTIVE_PRINT_CAPTURE = None
+            builtins.print = _ORIGINAL_PRINT
 
-    def _capture_print(self, *args, **kwargs) -> None:
+    def handle_print(self, *args, **kwargs) -> None:
         text = " ".join(str(a) for a in args)
+
         # Always forward to real print for terminal logging
-        self._original_print(*args, **kwargs)
+        _ORIGINAL_PRINT(*args, **kwargs)
 
         # Extract signals from backend print output
         if text.startswith("You: ") and "[filtered" not in text and "[too short" not in text:
@@ -146,6 +179,7 @@ class LiveSessionWorker(QObject):
             # Try to reuse preloaded models
             try:
                 from gui_app.preloader import get_preloaded
+
                 models = get_preloaded()
                 if models.ready:
                     stt = models.stt or STTService()
@@ -178,6 +212,7 @@ class LiveSessionWorker(QObject):
             if vcc._tts_client is None:
                 try:
                     from tts_client import TTSClient
+
                     vcc._tts_client = TTSClient(tts_service_url="http://127.0.0.1:5000", timeout=120)
                 except Exception as exc:
                     logger.warning("TTSClient not available: %s", exc)
@@ -251,7 +286,7 @@ class LiveSessionWorker(QObject):
                         )
 
                         # Check if the interruption was just confirmed
-                        # by the background ASR thread.  The print
+                        # by the background ASR thread. The print
                         # "[Assistant interrupted by user]" happens on
                         # that thread and PrintCapture may not see it,
                         # so we detect it directly from state.
@@ -307,8 +342,13 @@ class LiveSessionWorker(QObject):
                             def _finalize_bg(cap=capture):
                                 try:
                                     vcc.finalize_turn(
-                                        state, stt, turn_manager, session_id,
-                                        streamer, ser_model, speaker_verifier,
+                                        state,
+                                        stt,
+                                        turn_manager,
+                                        session_id,
+                                        streamer,
+                                        ser_model,
+                                        speaker_verifier,
                                     )
                                 except Exception as exc:
                                     logger.exception("finalize_turn failed")
@@ -320,7 +360,11 @@ class LiveSessionWorker(QObject):
                                     # didn't reply (filtered/hallucinated)
                                     # AND TTS isn't resuming from a false
                                     # interruption.
-                                    if not self._stop_requested and not cap.saw_teacher_reply and not cap.saw_tts_resume:
+                                    if (
+                                        not self._stop_requested
+                                        and not cap.saw_teacher_reply
+                                        and not cap.saw_tts_resume
+                                    ):
                                         self.status_changed.emit("Listening")
 
                             threading.Thread(

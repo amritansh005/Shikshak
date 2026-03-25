@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins as _builtins_module
 import logging
 import os
 import sys
@@ -10,6 +11,12 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import requests
+
+# Save the real builtin print at import time, BEFORE any
+# monkey-patching (e.g. PrintCapture in the GUI worker) can
+# replace it.  Used by speaker enrollment to print without
+# interfering with PrintCapture's signal extraction.
+_real_print = _builtins_module.print
 
 from app.config import settings
 from app.services.emotion_service import (
@@ -815,21 +822,15 @@ def finalize_turn(
 
         # ── Auto-enroll speaker on first real turn ─────────────────
         if speaker_verifier is not None and not speaker_verifier.is_enrolled:
-            import builtins
-            _saved_print = builtins.print
-            try:
-                builtins.print = __builtins__["print"] if isinstance(__builtins__, dict) else getattr(__builtins__, "print", _saved_print)
-            except Exception:
-                pass
             try:
                 enrolled = speaker_verifier.enroll(
                     audio_int16=audio_bytes,
                     sample_rate=settings.whisper_sample_rate,
                 )
                 if enrolled:
-                    _saved_print("  [Speaker profile enrolled]\n", flush=True)
-            finally:
-                builtins.print = _saved_print
+                    _real_print("  [Speaker profile enrolled]\n", flush=True)
+            except Exception as exc:
+                logger.warning("Speaker enrollment failed | error=%s", exc)
 
         text_emotion = classify_text_emotion(final_text)
 
