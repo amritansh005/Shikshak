@@ -634,6 +634,12 @@ def finalize_turn(
         tts_text_snapshot = state.interruption.tts_text_snapshot
         had_interruption = state.interruption.confirmed
 
+    # Flag: set to True when _prepare_for_tts_resume already handled
+    # state cleanup + streamer reset.  The finally block checks this to
+    # avoid a destructive double-reset that would kill any interruption
+    # the user started during the resumed TTS playback.
+    _resume_handled_cleanup = False
+
     try:
         if final_duration < settings.whisper_min_audio_ms / 1000.0:
             print("\nYou: [too short, ignored]\n", flush=True)
@@ -643,6 +649,7 @@ def finalize_turn(
                 print("[Resuming teacher speech]\n", flush=True)
                 _prepare_for_tts_resume(state)
                 _tts_resume_playback()
+                _resume_handled_cleanup = True
             return
 
         # ── Speaker verification gate ──
@@ -667,6 +674,7 @@ def finalize_turn(
                     print("[Resuming teacher speech]\n", flush=True)
                     _prepare_for_tts_resume(state)
                     _tts_resume_playback()
+                    _resume_handled_cleanup = True
                     return
 
         result = stt.transcribe_bytes(audio_bytes, partial=False)
@@ -685,6 +693,7 @@ def finalize_turn(
                 print("[Resuming teacher speech]\n", flush=True)
                 _prepare_for_tts_resume(state)
                 _tts_resume_playback()
+                _resume_handled_cleanup = True
             return
 
         # Only create interruption_meta from final-text keywords when TTS was
@@ -798,6 +807,7 @@ def finalize_turn(
                 print("[Resuming teacher speech]\n", flush=True)
                 _prepare_for_tts_resume(state)
                 _tts_resume_playback()
+                _resume_handled_cleanup = True
             return
 
         # ── Real speech confirmed — clear resume state, this is a genuine turn ──
@@ -890,6 +900,11 @@ def finalize_turn(
                 _tts_client.speak_neutral(teacher_text, session_id=session_id)
 
     finally:
+        if _resume_handled_cleanup:
+            # _prepare_for_tts_resume already reset state and requested
+            # a streamer reset.  Doing it again here would destroy any
+            # interruption the user started during the resumed TTS.
+            return
         _tts_restore_playback()
         with state.lock:
             if not state.needs_streamer_reset:
