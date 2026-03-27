@@ -10,7 +10,6 @@ from pydantic import BaseModel
 from app.services.chat_memory import ChatMemoryService
 from app.services.embedding_service import EmbeddingService
 from app.services.emotion_state_service import EmotionStateService
-from app.services.interruption_state_service import InterruptionStateService
 from app.services.llm_service import LLMService
 from app.services.recall_service import RecallService
 from app.services.summary_service import SummaryService
@@ -24,8 +23,159 @@ _summary_service: Optional[SummaryService] = None
 _embedding_service: Optional[EmbeddingService] = None
 _recall_service: Optional[RecallService] = None
 _emotion_state: Optional[EmotionStateService] = None
-_interruption_state: Optional[InterruptionStateService] = None
 _summary_lock = threading.Lock()
+
+
+def _sanitize_for_tts(text: str) -> str:
+    """
+    Convert any LaTeX / math notation in *text* into plain speakable English.
+
+    Strategy (universal — handles whatever formula the LLM produces):
+    1. Strip known LaTeX delimiters and extract the inner expression.
+    2. Replace common math symbols / commands with spoken words.
+    3. Clean up leftover backslashes, braces, and whitespace.
+
+    The replacements are ordered from most-specific to least-specific so
+    that multi-character sequences are handled before their sub-parts.
+    """
+
+    # ── 1. Unwrap LaTeX display / inline delimiters ──────────────────────
+    # \[ ... \]  and  \( ... \)  →  just the inner expression
+    text = re.sub(r"\\\[\s*(.*?)\s*\\\]", r" \1 ", text, flags=re.DOTALL)
+    text = re.sub(r"\\\(\s*(.*?)\s*\\\)", r" \1 ", text, flags=re.DOTALL)
+    # $$ ... $$  and  $ ... $
+    text = re.sub(r"\$\$\s*(.*?)\s*\$\$", r" \1 ", text, flags=re.DOTALL)
+    text = re.sub(r"\$\s*(.*?)\s*\$", r" \1 ", text)
+
+    # ── 2. Named LaTeX commands → spoken words ───────────────────────────
+    replacements = [
+        # --- fractions ---
+        # \frac{A}{B}  →  "A over B"
+        (re.compile(r"\\frac\s*\{([^}]*)\}\s*\{([^}]*)\}"), r"\1 over \2"),
+
+        # --- superscripts / subscripts ---
+        # ^{...}  →  "to the power of ..."   (multi-char exponent)
+        (re.compile(r"\^\{([^}]+)\}"), r" to the power of \1"),
+        # ^2  →  "squared",  ^3  →  "cubed",  ^n  →  "to the power of n"
+        (re.compile(r"\^2\b"), " squared "),
+        (re.compile(r"\^3\b"), " cubed "),
+        (re.compile(r"\^([A-Za-z0-9])"), r" to the power of \1 "),
+        # _{...}  and  _x  →  "sub ..."
+        (re.compile(r"_\{([^}]+)\}"), r" sub \1 "),
+        (re.compile(r"_([A-Za-z0-9])"), r" sub \1 "),
+
+        # --- square / nth roots ---
+        (re.compile(r"\\sqrt\s*\[([^\]]+)\]\s*\{([^}]*)\}"), r"\1th root of \2"),
+        (re.compile(r"\\sqrt\s*\{([^}]*)\}"), r"square root of \1"),
+        (re.compile(r"\\sqrt\b"), "square root of"),
+
+        # --- named functions ---
+        (re.compile(r"\\sin\b"), "sine"),
+        (re.compile(r"\\cos\b"), "cosine"),
+        (re.compile(r"\\tan\b"), "tangent"),
+        (re.compile(r"\\sec\b"), "secant"),
+        (re.compile(r"\\csc\b"), "cosecant"),
+        (re.compile(r"\\cot\b"), "cotangent"),
+        (re.compile(r"\\arcsin\b"), "arc sine"),
+        (re.compile(r"\\arccos\b"), "arc cosine"),
+        (re.compile(r"\\arctan\b"), "arc tangent"),
+        (re.compile(r"\\ln\b"), "natural log"),
+        (re.compile(r"\\log\b"), "log"),
+        (re.compile(r"\\exp\b"), "e to the power of"),
+        (re.compile(r"\\lim\b"), "the limit"),
+        (re.compile(r"\\sum\b"), "the sum"),
+        (re.compile(r"\\prod\b"), "the product"),
+        (re.compile(r"\\int\b"), "the integral of"),
+        (re.compile(r"\\infty\b"), "infinity"),
+
+        # --- Greek letters ---
+        (re.compile(r"\\alpha\b"), "alpha"),
+        (re.compile(r"\\beta\b"), "beta"),
+        (re.compile(r"\\gamma\b"), "gamma"),
+        (re.compile(r"\\delta\b"), "delta"),
+        (re.compile(r"\\epsilon\b"), "epsilon"),
+        (re.compile(r"\\varepsilon\b"), "epsilon"),
+        (re.compile(r"\\zeta\b"), "zeta"),
+        (re.compile(r"\\eta\b"), "eta"),
+        (re.compile(r"\\theta\b"), "theta"),
+        (re.compile(r"\\lambda\b"), "lambda"),
+        (re.compile(r"\\mu\b"), "mu"),
+        (re.compile(r"\\nu\b"), "nu"),
+        (re.compile(r"\\xi\b"), "xi"),
+        (re.compile(r"\\pi\b"), "pi"),
+        (re.compile(r"\\rho\b"), "rho"),
+        (re.compile(r"\\sigma\b"), "sigma"),
+        (re.compile(r"\\tau\b"), "tau"),
+        (re.compile(r"\\phi\b"), "phi"),
+        (re.compile(r"\\chi\b"), "chi"),
+        (re.compile(r"\\psi\b"), "psi"),
+        (re.compile(r"\\omega\b"), "omega"),
+        (re.compile(r"\\Omega\b"), "Omega"),
+        (re.compile(r"\\Delta\b"), "Delta"),
+        (re.compile(r"\\Sigma\b"), "Sigma"),
+        (re.compile(r"\\Lambda\b"), "Lambda"),
+        (re.compile(r"\\Gamma\b"), "Gamma"),
+        (re.compile(r"\\Pi\b"), "Pi"),
+        (re.compile(r"\\Theta\b"), "Theta"),
+
+        # --- operators and relations ---
+        (re.compile(r"\\times\b"), "times"),
+        (re.compile(r"\\cdot\b"), "times"),
+        (re.compile(r"\\div\b"), "divided by"),
+        (re.compile(r"\\pm\b"), "plus or minus"),
+        (re.compile(r"\\mp\b"), "minus or plus"),
+        (re.compile(r"\\leq\b"), "less than or equal to"),
+        (re.compile(r"\\geq\b"), "greater than or equal to"),
+        (re.compile(r"\\neq\b"), "not equal to"),
+        (re.compile(r"\\approx\b"), "approximately"),
+        (re.compile(r"\\equiv\b"), "is equivalent to"),
+        (re.compile(r"\\propto\b"), "is proportional to"),
+        (re.compile(r"\\rightarrow\b"), "goes to"),
+        (re.compile(r"\\leftarrow\b"), "comes from"),
+        (re.compile(r"\\Rightarrow\b"), "implies"),
+        (re.compile(r"\\Leftarrow\b"), "is implied by"),
+        (re.compile(r"\\leftrightarrow\b"), "if and only if"),
+
+        # --- sets ---
+        (re.compile(r"\\in\b"), "in"),
+        (re.compile(r"\\notin\b"), "not in"),
+        (re.compile(r"\\subset\b"), "is a subset of"),
+        (re.compile(r"\\cup\b"), "union"),
+        (re.compile(r"\\cap\b"), "intersection"),
+        (re.compile(r"\\emptyset\b"), "the empty set"),
+
+        # --- misc common commands ---
+        (re.compile(r"\\text\s*\{([^}]*)\}"), r"\1"),
+        (re.compile(r"\\mathrm\s*\{([^}]*)\}"), r"\1"),
+        (re.compile(r"\\mathbf\s*\{([^}]*)\}"), r"\1"),
+        (re.compile(r"\\vec\s*\{([^}]*)\}"), r"vector \1"),
+        (re.compile(r"\\hat\s*\{([^}]*)\}"), r"\1 hat"),
+        (re.compile(r"\\bar\s*\{([^}]*)\}"), r"\1 bar"),
+        (re.compile(r"\\dot\s*\{([^}]*)\}"), r"\1 dot"),
+        (re.compile(r"\\ddot\s*\{([^}]*)\}"), r"\1 double-dot"),
+        (re.compile(r"\\overline\s*\{([^}]*)\}"), r"\1 bar"),
+        (re.compile(r"\\left\b"), ""),
+        (re.compile(r"\\right\b"), ""),
+        (re.compile(r"\\cdots\b"), "and so on"),
+        (re.compile(r"\\ldots\b"), "and so on"),
+        (re.compile(r"\\partial\b"), "partial"),
+        (re.compile(r"\\nabla\b"), "nabla"),
+        (re.compile(r"\\hbar\b"), "h-bar"),
+    ]
+
+    for pattern, replacement in replacements:
+        text = pattern.sub(replacement, text)
+
+    # ── 3. Strip remaining braces and lone backslashes ───────────────────
+    text = re.sub(r"\\[A-Za-z]+", "", text)   # any unknown \command
+    text = text.replace("{", "").replace("}", "")
+    text = text.replace("\\", "")
+
+    # ── 4. Normalise whitespace ───────────────────────────────────────────
+    text = re.sub(r" {2,}", " ", text)
+    text = text.strip()
+
+    return text
 
 
 def _has_explicit_recall_cue(message: str) -> bool:
@@ -42,7 +192,7 @@ def _has_explicit_recall_cue(message: str) -> bool:
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     global _llm, _memory, _summary_service, _embedding_service
-    global _recall_service, _emotion_state, _interruption_state
+    global _recall_service, _emotion_state
 
     logger.info("Initialising shared services...")
     _llm = LLMService()
@@ -55,7 +205,6 @@ async def lifespan(application: FastAPI):
         embedding_service=_embedding_service,
     )
     _emotion_state = EmotionStateService()
-    _interruption_state = InterruptionStateService()
 
     logger.info("Warming up models...")
     try:
@@ -105,43 +254,6 @@ def root() -> dict:
     return {"message": "AI Teacher API is running"}
 
 
-def _build_resume_question(topic: str) -> str:
-    topic = topic.strip().rstrip(".")
-    return f"\n\nShould I continue with {topic}, or would you like to talk about something else?"
-
-
-# Regex to find the [PENDING_TOPIC: ...] tag the LLM appends on interruption turns.
-_PENDING_TOPIC_RE = re.compile(
-    r"\[PENDING_TOPIC:\s*(.+?)\]\s*$",
-    re.IGNORECASE,
-)
-
-
-def _parse_and_strip_pending_topic(response: str) -> tuple:
-    """
-    Parse and remove the [PENDING_TOPIC: ...] tag from the LLM response.
-
-    Returns:
-        (clean_response, topic_or_none)
-
-    topic_or_none is:
-      - None  if no tag was found
-      - ""    if the LLM wrote [PENDING_TOPIC: none]
-      - str   the extracted topic otherwise
-    """
-    match = _PENDING_TOPIC_RE.search(response)
-    if not match:
-        return response, None
-
-    raw_topic = match.group(1).strip()
-    clean_response = response[: match.start()].rstrip()
-
-    if raw_topic.lower() in ("none", "n/a", "nil", "nothing", "no topic", "greeting", "small talk", "small-talk"):
-        return clean_response, ""
-
-    return clean_response, raw_topic
-
-
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
     user_input = req.message.strip()
@@ -159,82 +271,10 @@ def chat(req: ChatRequest) -> ChatResponse:
     conversation_summary = _memory.get_conversation_summary_for_prompt(session_id)
     history_messages = _memory.get_recent_history_for_prompt(session_id)
 
-    # ─────────────────────────────────────────────────────────────
-    # 1) Interruption state / pending-topic control
-    # ─────────────────────────────────────────────────────────────
-    pending_state = _interruption_state.get_state(session_id)
-
     llm_user_message = user_input
-    force_direct_response: Optional[str] = None
-
-    if pending_state.waiting_for_resume_decision and pending_state.pending_topic:
-        decision = _interruption_state.classify_resume_reply(user_input)
-
-        logger.info(
-            "Pending-topic resume decision | session_id=%s | pending_topic=%r | kind=%s | extracted_topic=%r",
-            session_id,
-            pending_state.pending_topic,
-            decision["kind"],
-            decision.get("topic"),
-        )
-
-        if decision["kind"] == "continue":
-            topic = pending_state.pending_topic
-            _interruption_state.clear(session_id)
-            llm_user_message = (
-                f"Please continue teaching this topic clearly and naturally from the beginning, "
-                f"not from the middle of an interrupted sentence: {topic}"
-            )
-
-        elif decision["kind"] == "decline":
-            _interruption_state.clear(session_id)
-            force_direct_response = "Okay — what would you like to talk about now?"
-
-        elif decision["kind"] == "new_topic":
-            _interruption_state.clear(session_id)
-            llm_user_message = decision["topic"] or user_input
-
-        else:
-            # Ambiguous reply while waiting for a resume decision.
-            # Ask again rather than relying on a small model to infer too much.
-            force_direct_response = (
-                f"I still have {pending_state.pending_topic} pending. "
-                f"Would you like me to continue with that, or would you like to switch to another topic?"
-            )
-
-    # If we already know the response, skip recall/LLM generation.
-    if force_direct_response is not None:
-        full_response = force_direct_response
-        directive_dict = None
-
-        # Save actual messages.
-        _memory.save_message(session_id=session_id, role="user", content=user_input)
-        _memory.save_message(session_id=session_id, role="assistant", content=full_response)
-        logger.info("Direct interruption-state response returned without LLM generation.")
-
-        _snap_session = session_id
-
-        def _update_summary_background() -> None:
-            if not _summary_lock.acquire(blocking=False):
-                logger.info("Summary update skipped — previous update still running.")
-                return
-            try:
-                logger.info("Older conversation summary update started.")
-                _memory.update_older_conversation_summary(
-                    session_id=_snap_session,
-                    summary_service=_summary_service,
-                )
-                logger.info("Older conversation summary update completed.")
-            except Exception as exc:
-                logger.warning("Older conversation summary update failed | error=%s", exc)
-            finally:
-                _summary_lock.release()
-
-        threading.Thread(target=_update_summary_background, daemon=True).start()
-        return ChatResponse(response=full_response, directive=directive_dict)
 
     # ─────────────────────────────────────────────────────────────
-    # 2) Standard recall pipeline
+    # 1) Standard recall pipeline
     # ─────────────────────────────────────────────────────────────
     recall_decision = _recall_service.get_recall_decision_for_turn(
         user_message=llm_user_message,
@@ -291,10 +331,9 @@ def chat(req: ChatRequest) -> ChatResponse:
     )
 
     # ─────────────────────────────────────────────────────────────
-    # 3) Emotion state tracking
+    # 2) Emotion state tracking
     # ─────────────────────────────────────────────────────────────
     emotion_instruction = ""
-    directive = None
     directive_dict = None
 
     if req.emotion:
@@ -318,13 +357,8 @@ def chat(req: ChatRequest) -> ChatResponse:
         }
 
     # ─────────────────────────────────────────────────────────────
-    # 4) Normal LLM generation
+    # 3) LLM generation
     # ─────────────────────────────────────────────────────────────
-    # Detect interruption early so we can pass context to the LLM.
-    interruption_meta: Dict[str, Any] = req.interruption_meta or {}
-    was_interruption = bool(interruption_meta.get("interrupted"))
-    interrupted_assistant_text = (interruption_meta.get("interrupted_assistant_text") or "").strip()
-
     full_response = _llm.generate(
         user_message=llm_user_message,
         history_messages=history_messages,
@@ -334,7 +368,6 @@ def chat(req: ChatRequest) -> ChatResponse:
         recall_clarification_question=recall_clarification_question,
         fresh_teach_topic=fresh_teach_topic,
         emotion_instruction=emotion_instruction,
-        interruption_context=interrupted_assistant_text if was_interruption else "",
     )
 
     logger.info(
@@ -342,40 +375,8 @@ def chat(req: ChatRequest) -> ChatResponse:
         len(full_response),
     )
 
-    # ─────────────────────────────────────────────────────────────
-    # 5) If this user turn interrupted TTS, parse the LLM's
-    #    [PENDING_TOPIC: ...] tag to decide whether to store a
-    #    pending topic and append a resume question.
-    # ─────────────────────────────────────────────────────────────
-    if was_interruption:
-        full_response, llm_topic = _parse_and_strip_pending_topic(full_response)
-
-        if llm_topic is None:
-            # LLM didn't produce the tag — fall back to not storing
-            # a pending topic (safe default: no resume question).
-            logger.info(
-                "No [PENDING_TOPIC] tag found in LLM response | session_id=%s",
-                session_id,
-            )
-        elif llm_topic == "":
-            # LLM explicitly said "none" — greeting / small-talk, skip.
-            logger.info(
-                "LLM indicated interrupted content was greeting/small-talk | session_id=%s",
-                session_id,
-            )
-        else:
-            # Real topic — store it and append resume question.
-            _interruption_state.mark_pending_topic(
-                session_id=session_id,
-                topic=llm_topic,
-                interrupted_assistant_text=interrupted_assistant_text,
-            )
-            full_response = full_response.rstrip() + _build_resume_question(llm_topic)
-            logger.info(
-                "Pending topic marked from LLM tag | session_id=%s | topic=%r",
-                session_id,
-                llm_topic,
-            )
+    # Strip LaTeX / math notation so the response is clean for TTS.
+    full_response = _sanitize_for_tts(full_response)
 
     # Save actual spoken/user-visible turn, not the synthetic llm_user_message.
     _memory.save_message(session_id=session_id, role="user", content=user_input)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Dict, Iterator, List, Optional, Type
 
 import ollama
@@ -33,50 +34,54 @@ logger = logging.getLogger(__name__)
 AI_TEACHER_SYSTEM_PROMPT = """
 You are an excellent teacher.
 
-You can teach many subjects such as science, mathematics, history, arts, and general knowledge.
+Identity:
+- You teach clearly, simply, and naturally.
+- Your goal is to help the student understand, not just memorize.
 
-Your goal is to help students truly understand ideas, not just memorize answers.
+Instruction priority:
+- First, answer the student's current message.
+- Second, follow the response length rules.
+- Third, use examples only when they truly help.
 
-Teaching behavior:
+Permanent rules:
+- Use simple language.
+- Be friendly, calm, and supportive.
+- Focus on the main idea first.
+- Teach step by step when needed.
+- Be honest. If you do not know something, say so.
+- If the student's request is unclear, ask one short clarification question instead of guessing.
+- Do not pretend to remember earlier conversation unless it appears in the provided context.
+- Do not sound like a textbook.
+- Do not ask follow-up questions unless they truly help.
+- Do not explain extra side topics unless the student asks.
+- Avoid repetition.
 
-- Explain ideas in simple language.
-- Teach step by step like a good teacher.
-- Keep explanations clear and not too long.
-- Focus on the key idea first, then add details if needed.
-- Use examples or analogies when they help understanding.
-- If the student asks for more examples, give multiple short examples instead of repeating the same explanation.
-- If the student is confused, explain again in a simpler way.
-- If you do not know something, say you do not know.
+Response length rules:
+- Default response: about 2 to 5 short sentences.
+- For simple questions: 1 to 3 sentences.
+- Use at most one short example unless the student asks for more.
+- Do not give long detailed teaching unless the student explicitly asks for detail.
+- Avoid long introductions and long conclusions.
 
-Conversation style:
+Default answer pattern:
+- Start with the direct answer or explanation.
+- Add one short example only if it truly helps.
+- End with one short summary line only if it adds value.
 
-- Talk like a friendly and supportive teacher.
-- Be natural, not like a textbook.
-- Do NOT ask a follow-up question every time.
-- Ask questions only when it genuinely helps learning.
+Broad-request rule:
+- If the student says something broad like "teach me physics" or "I want to study math", do not begin a full lesson immediately.
+- Instead, ask what specific topic they want and suggest 2 or 3 options.
 
-When the student asks a question:
+Reply style:
+- Sound natural and conversational.
+- Do not use headings, bullet points, or numbered lists in the reply unless the student asks for a structured answer.
+- Never use LaTeX, markdown math, or any formula notation such as \(...\), \[...\], $$...$$, or $...$. Write all formulas in plain English. For example, write "F equals m times a" instead of "\( F = ma \)", and "the square root of 16" instead of "\( \sqrt{16} \)".
 
-1. Explain the concept clearly.
-2. Give a simple example or analogy if useful.
-3. Give a short summary in 1–2 lines.
-
-If the student says something vague like:
-"I want to study physics" or "teach me math"
-
-Do NOT start a random lesson.  
-Instead ask what specific topic they want to learn and suggest 2–3 possible topics.
-
-Emotion-aware teaching:
-
-You may receive a note about the student's current emotional state.
-When you do, adapt your teaching style naturally:
-- Do NOT announce the student's emotion. Never say "I can see you are frustrated".
-- Do NOT label or name the emotion in your response.
-- Instead, silently adjust your tone, pace, and approach based on the instruction.
-- If the student is struggling, be warmer and simpler without pointing it out.
-- If the student is confident, you can move faster without over-explaining.
-- The goal is for the student to feel understood, not analyzed.
+Emotion-aware behavior:
+- You may receive a separate teaching-style note about the student's current state.
+- If you receive one, adapt your tone and pace naturally.
+- Do not mention or label the student's emotion.
+- Silently become warmer, simpler, slower, or more encouraging when needed.
 
 Your mission is to make learning clear, simple, and enjoyable.
 """.strip()
@@ -86,7 +91,9 @@ class LLMService:
     def __init__(self) -> None:
         # ── Foreground (GPU) ──────────────────────────────────────────
         self.model = os.getenv("LLM_MODEL", "qwen2.5:3b")
-        self.temperature = float(os.getenv("LLM_TEMPERATURE", "0.5"))
+        self.temperature = float(os.getenv("LLM_TEMPERATURE", "0.3"))
+        self.top_p = float(os.getenv("LLM_TOP_P", "0.85"))
+        self.repeat_penalty = float(os.getenv("LLM_REPEAT_PENALTY", "1.1"))
         self.enable_streaming = os.getenv("ENABLE_STREAMING", "true").lower() == "true"
 
         fg_host = os.getenv("OLLAMA_FG_HOST", "http://127.0.0.1:11434")
@@ -98,14 +105,27 @@ class LLMService:
         self.bg_client = ollama.Client(host=bg_host)
 
         logger.info(
-            "LLMService initialised | fg_model=%s | fg_host=%s | bg_model=%s | bg_host=%s | temperature=%s | streaming=%s",
+            (
+                "LLMService initialised | fg_model=%s | fg_host=%s | "
+                "bg_model=%s | bg_host=%s | temperature=%s | "
+                "top_p=%s | repeat_penalty=%s | streaming=%s"
+            ),
             self.model,
             fg_host,
             self.bg_model,
             bg_host,
             self.temperature,
+            self.top_p,
+            self.repeat_penalty,
             self.enable_streaming,
         )
+
+    def _foreground_options(self) -> Dict[str, float]:
+        return {
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "repeat_penalty": self.repeat_penalty,
+        }
 
     def build_messages(
         self,
@@ -117,7 +137,6 @@ class LLMService:
         recall_clarification_question: str = "",
         fresh_teach_topic: str = "",
         emotion_instruction: str = "",
-        interruption_context: str = "",
     ) -> List[Dict[str, str]]:
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": AI_TEACHER_SYSTEM_PROMPT},
@@ -227,29 +246,12 @@ class LLMService:
             for item in history_messages:
                 role = item.get("role")
                 content = item.get("content", "")
-                if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
+                if (
+                    role in {"user", "assistant"}
+                    and isinstance(content, str)
+                    and content.strip()
+                ):
                     messages.append({"role": role, "content": content.strip()})
-
-        # ── Interruption: ask the LLM to identify the pending topic ──
-        if interruption_context.strip():
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "The student just interrupted your previous response. "
-                        "Here is what you were saying when interrupted:\n"
-                        f'"{interruption_context.strip()[:300]}"\n\n'
-                        "First, answer the student's current question normally.\n"
-                        "Then, on the VERY LAST LINE of your response, write exactly:\n"
-                        "[PENDING_TOPIC: <topic>]\n"
-                        "where <topic> is the specific subject you were teaching when interrupted "
-                        "(for example: Newton's first law of motion, quadratic equations, the French Revolution).\n"
-                        "If you were just greeting, making small-talk, or not teaching any specific topic, write:\n"
-                        "[PENDING_TOPIC: none]\n"
-                        "This line must always be the very last line. Do not add anything after it."
-                    ),
-                }
-            )
 
         messages.append({"role": "user", "content": user_message})
 
@@ -276,24 +278,25 @@ class LLMService:
         recall_clarification_question: str = "",
         fresh_teach_topic: str = "",
         emotion_instruction: str = "",
-        interruption_context: str = "",
     ) -> str:
+        messages = self.build_messages(
+            user_message=user_message,
+            history_messages=history_messages,
+            conversation_summary=conversation_summary,
+            recalled_memory=recalled_memory,
+            recall_clarification_mode=recall_clarification_mode,
+            recall_clarification_question=recall_clarification_question,
+            fresh_teach_topic=fresh_teach_topic,
+            emotion_instruction=emotion_instruction,
+        )
+
         response = self.fg_client.chat(
             model=self.model,
-            messages=self.build_messages(
-                user_message=user_message,
-                history_messages=history_messages,
-                conversation_summary=conversation_summary,
-                recalled_memory=recalled_memory,
-                recall_clarification_mode=recall_clarification_mode,
-                recall_clarification_question=recall_clarification_question,
-                fresh_teach_topic=fresh_teach_topic,
-                emotion_instruction=emotion_instruction,
-                interruption_context=interruption_context,
-            ),
+            messages=messages,
             stream=False,
-            options={"temperature": self.temperature},
+            options=self._foreground_options(),
         )
+
         return response["message"]["content"].strip()
 
     def stream_generate(
@@ -306,7 +309,6 @@ class LLMService:
         recall_clarification_question: str = "",
         fresh_teach_topic: str = "",
         emotion_instruction: str = "",
-        interruption_context: str = "",
     ) -> Iterator[str]:
         if not self.enable_streaming:
             yield self.generate(
@@ -318,32 +320,35 @@ class LLMService:
                 recall_clarification_question=recall_clarification_question,
                 fresh_teach_topic=fresh_teach_topic,
                 emotion_instruction=emotion_instruction,
-                interruption_context=interruption_context,
             )
             return
+
+        messages = self.build_messages(
+            user_message=user_message,
+            history_messages=history_messages,
+            conversation_summary=conversation_summary,
+            recalled_memory=recalled_memory,
+            recall_clarification_mode=recall_clarification_mode,
+            recall_clarification_question=recall_clarification_question,
+            fresh_teach_topic=fresh_teach_topic,
+            emotion_instruction=emotion_instruction,
+        )
 
         logger.info("Foreground stream_generate started.")
         try:
             stream = self.fg_client.chat(
                 model=self.model,
-                messages=self.build_messages(
-                    user_message=user_message,
-                    history_messages=history_messages,
-                    conversation_summary=conversation_summary,
-                    recalled_memory=recalled_memory,
-                    recall_clarification_mode=recall_clarification_mode,
-                    recall_clarification_question=recall_clarification_question,
-                    fresh_teach_topic=fresh_teach_topic,
-                    emotion_instruction=emotion_instruction,
-                    interruption_context=interruption_context,
-                ),
+                messages=messages,
                 stream=True,
-                options={"temperature": self.temperature},
+                options=self._foreground_options(),
             )
+
             for chunk in stream:
                 content = chunk.get("message", {}).get("content", "")
-                if content:
-                    yield content
+                if not content:
+                    continue
+                yield content
+
         finally:
             logger.info("Foreground stream_generate completed.")
 
