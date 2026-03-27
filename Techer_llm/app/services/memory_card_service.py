@@ -12,38 +12,47 @@ logger = logging.getLogger(__name__)
 MEMORY_EXTRACTION_SYSTEM_PROMPT = """
 You extract useful teaching memories for an AI teacher.
 
-Default rule:
-Create a memory card for most student-teacher exchanges.
+─── WHEN TO CREATE A MEMORY CARD ───────────────────────────────────────────
 
-Set should_create_memory = true if the exchange contains any useful learning content, such as:
-- a topic or concept
-- a question and answer
-- an explanation
-- an example or analogy
-- a solved problem
-- a fact
-- a student confusion
-- a follow-up on the same topic
-- a comparison or relationship between ideas
+Set should_create_memory = true if the exchange contains actual teaching content:
+- a concept or fact was explained
+- a question was answered with substance
+- an example or analogy was given
+- a problem was solved
+- a student confusion was addressed
+- a comparison or relationship between ideas was made
+- a follow-up explanation on an ongoing topic
 
-Set should_create_memory = false only if the exchange is only:
-- greeting
-- thanks
-- filler
-- goodbye
-- no real learning content
+Set should_create_memory = false if the exchange is:
+- a greeting only ("hey", "how are you", "good morning", etc.)
+- thanks, filler, or small talk only
+- goodbye only
+- the student asking what to study and the teacher asking back — but no actual teaching happened yet
+- a topic suggestion with no explanation (e.g. "can we talk about X?" / "sure, what area?")
 
-When unsure, create the memory card.
+Examples that must be FALSE:
+- Student: "Hey how are you" / Teacher: "I'm well, how can I help?" → false
+- Student: "Can we talk about history?" / Teacher: "Sure! What area?" → false
+- Student: "Thanks!" / Teacher: "You're welcome!" → false
 
-When creating memory:
-- topic = short label
-- snippet = short summary of what was taught
-- retrieval_text = key facts, answers, examples, equations, names, dates, or ideas needed to recall it later
-- confusion = student confusion if present
-- helpful_example = example or analogy if present
-- status = short learning status
+Examples that must be TRUE:
+- Student: "What is Newton's third law?" / Teacher: "Every action has an equal and opposite reaction..." → true
+- Student: "Who were the villains of the French Revolution?" / Teacher: "Louis XVI and Marie Antoinette were..." → true
+- Student: "I'm confused about velocity" / Teacher: "Velocity is speed with direction..." → true
 
-Keep it short, clear, and factual.
+When unsure, prefer true over false only if real information was exchanged.
+
+─── HOW TO FILL THE FIELDS ─────────────────────────────────────────────────
+
+- topic = short label for the subject (e.g. "Newton's Third Law", "French Revolution villains")
+- snippet = 1-2 sentence summary of what was actually taught
+- retrieval_text = key facts, answers, names, dates, equations, or ideas needed to recall this later. Write as complete sentences, not raw conversation.
+- confusion = student confusion if clearly present, else leave empty
+- helpful_example = copy the example or analogy EXACTLY as the teacher said it, word for word. Do not paraphrase. If no example was used, leave empty.
+- student_preference = student's preferred learning style if expressed, else leave empty
+- status = one of: "introduced", "concept explained", "question answered", "in progress", "confused", "mastered"
+
+Keep all fields short, clear, and factual.
 Return only valid JSON matching the schema.
 """.strip()
 
@@ -78,14 +87,27 @@ class MemoryCardService:
         """Shared extraction logic used by both entry points."""
         formatted = self._format_messages(messages)
 
+        logger.info(
+            "\n"
+            "┌─ Memory Extraction Started ─────────────────────────────\n"
+            "│  session_id : %s\n"
+            "│  messages   : %d\n"
+            "│  exchange   :\n%s\n"
+            "└─────────────────────────────────────────────────────────",
+            session_id,
+            len(messages),
+            "\n".join(f"│    {line}" for line in formatted.splitlines()),
+        )
+
         user_prompt = f"""
 Latest messages:
 {formatted}
 
 Extract a memory card for this exchange.
 
-Create memory (should_create_memory=true) if the student and teacher discussed ANY topic, concept, question, or idea.
-Only skip (should_create_memory=false) if this is purely a greeting, thanks, or filler with no educational content.
+Create memory (should_create_memory=true) ONLY if real teaching content was exchanged — a concept explained, a question answered with substance, a fact given, or a confusion addressed.
+
+Skip (should_create_memory=false) if this is a greeting, small talk, topic suggestion with no explanation, or filler with no actual learning content.
 """.strip()
 
         parsed = self.llm.structured_chat(
@@ -106,20 +128,61 @@ Only skip (should_create_memory=false) if this is purely a greeting, thanks, or 
                 )
                 parsed = self._build_fallback_memory(messages)
             else:
-                logger.info("Memory extraction decided not to create memory card.")
+                logger.info(
+                    "\n"
+                    "┌─ Memory Card Skipped ───────────────────────────────────\n"
+                    "│  reason : LLM decided no educational content\n"
+                    "└─────────────────────────────────────────────────────────"
+                )
                 return
+
+        # ── Log the raw extracted card before any post-processing ────
+        logger.info(
+            "\n"
+            "┌─ Memory Card Extracted ─────────────────────────────────\n"
+            "│  should_create  : %s\n"
+            "│  topic          : %s\n"
+            "│  status         : %s\n"
+            "│  snippet        : %s\n"
+            "│  retrieval_text : %s\n"
+            "│  confusion      : %s\n"
+            "│  helpful_example: %s\n"
+            "│  student_pref   : %s\n"
+            "└─────────────────────────────────────────────────────────",
+            parsed.should_create_memory,
+            parsed.topic or "(empty)",
+            parsed.status or "(empty)",
+            (parsed.snippet or "(empty)")[:120],
+            (parsed.retrieval_text or "(empty)")[:120],
+            parsed.confusion or "(none)",
+            (parsed.helpful_example or "(none)")[:120],
+            parsed.student_preference or "(none)",
+        )
 
         retrieval_text = (parsed.retrieval_text or "").strip()
         if not retrieval_text:
+            logger.info("retrieval_text was empty — rebuilding from fields.")
             retrieval_text = self._build_retrieval_text(parsed)
 
         if not retrieval_text:
-            logger.info("Memory extraction produced empty retrieval_text. Skipping memory card.")
+            logger.info(
+                "\n"
+                "┌─ Memory Card Skipped ───────────────────────────────────\n"
+                "│  reason : retrieval_text empty after rebuild\n"
+                "└─────────────────────────────────────────────────────────"
+            )
             return
 
         embedding = self.embedding_service.embed_text(retrieval_text)
         if not embedding:
-            logger.warning("Could not create embedding for memory card.")
+            logger.warning(
+                "\n"
+                "┌─ Memory Card Failed ────────────────────────────────────\n"
+                "│  reason : could not create embedding\n"
+                "│  topic  : %s\n"
+                "└─────────────────────────────────────────────────────────",
+                parsed.topic or "(empty)",
+            )
             return
 
         self.memory.save_memory_card(
@@ -135,9 +198,21 @@ Only skip (should_create_memory=false) if this is purely a greeting, thanks, or 
         )
 
         logger.info(
-            "Memory card stored successfully | topic=%r | status=%r",
-            parsed.topic,
-            parsed.status,
+            "\n"
+            "┌─ Memory Card Stored ✓ ──────────────────────────────────\n"
+            "│  topic          : %s\n"
+            "│  status         : %s\n"
+            "│  snippet        : %s\n"
+            "│  retrieval_text : %s\n"
+            "│  confusion      : %s\n"
+            "│  helpful_example: %s\n"
+            "└─────────────────────────────────────────────────────────",
+            parsed.topic or "(empty)",
+            parsed.status or "(empty)",
+            (parsed.snippet or "(empty)")[:120],
+            retrieval_text[:120],
+            parsed.confusion or "(none)",
+            (parsed.helpful_example or "(none)")[:120],
         )
 
     @staticmethod
@@ -199,13 +274,18 @@ Only skip (should_create_memory=false) if this is purely a greeting, thanks, or 
         if stripped_user in noise_phrases or len(stripped_user) < 4:
             return False
 
+        # Skip if teacher response is too short to be real teaching
+        # e.g. "Sure! What area of history?" is not teaching
+        if len(combined_assistant.strip()) < 80:
+            return False
+
         # Student asking/exploring something
         user_question_cues = (
             "what is", "what are", "how", "why", "explain", "tell me",
             "describe", "define", "example", "difference between",
             "compare", "relation", "who is", "who was", "when did",
             "where", "can you", "show me", "help me", "teach me",
-            # math cues (kept from before)
+            # math cues
             "solve", "equation", "answer", "math", "calculate", "=",
             "find x", "what is the answer",
         )
@@ -216,7 +296,7 @@ Only skip (should_create_memory=false) if this is purely a greeting, thanks, or 
             "works by", "because", "therefore", "in other words",
             "for instance", "such as", "this is", "let's", "imagine",
             "think of", "consider", "summary",
-            # math cues (kept from before)
+            # math cues
             "the solution", "the answer", "x =", "divide both sides",
             "simplify", "result",
         )

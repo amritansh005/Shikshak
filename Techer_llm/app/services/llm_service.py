@@ -13,23 +13,32 @@ from pydantic import BaseModel
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Two-instance Ollama strategy
-# ─────────────────────────────
-# We run TWO separate Ollama processes on different ports:
+# Single-instance Ollama strategy (GPU)
+# ──────────────────────────────────────
+# Both foreground and background clients point to the SAME Ollama
+# instance (port 11434, GPU).  OLLAMA_MAX_LOADED_MODELS=2 must be set
+# before starting Ollama so both models stay resident in VRAM:
 #
-#   Instance 1 (GPU, port 11434 — default):
+#   $env:OLLAMA_MAX_LOADED_MODELS = "2"; ollama serve
+#
+#   Instance (GPU, port 11434):
 #     • stream_generate() / generate() — foreground teacher responses.
-#     • Runs qwen2.5:3b on GPU for fast, low-latency answers.
-#
-#   Instance 2 (CPU, port 11435):
+#       Runs qwen2.5:3b on GPU for fast, low-latency answers.
 #     • structured_chat() — background tasks like memory-card extraction,
 #       recall decisions, summary generation, etc.
-#     • Runs gemma2:2b on CPU.
+#       Runs gemma2:2b on GPU with a small num_ctx (512) so its KV cache
+#       stays tiny and both models fit comfortably in 6 GiB VRAM.
+#
+# VRAM budget (approximate, num_ctx=4096 for qwen, 512 for gemma):
+#   qwen2.5:3b  weights ~1.8 GiB  +  KV ~144 MiB  +  compute ~301 MiB
+#   gemma2:2b   weights ~1.5 GiB  +  KV  ~26 MiB  +  compute ~505 MiB
+#   ─────────────────────────────────────────────────────────────────
+#   Total                                              ≈ 4.3 GiB  ✅
 #
 # Memory card extraction is handled by a SEPARATE worker process
 # (memory_worker.py) that reads unprocessed turns from SQLite and
-# sends them to Instance 2. This means the chat loop never skips
-# memory cards, no matter how fast the student types.
+# sends them to the background model.  The chat loop therefore never
+# blocks on memory cards no matter how fast the student types.
 
 AI_TEACHER_SYSTEM_PROMPT = """
 You are an excellent teacher.
@@ -99,21 +108,26 @@ class LLMService:
         fg_host = os.getenv("OLLAMA_FG_HOST", "http://127.0.0.1:11434")
         self.fg_client = ollama.Client(host=fg_host)
 
-        # ── Background (CPU) ─────────────────────────────────────────
+        # ── Background (GPU, same instance) ──────────────────────────
+        # Points to the same Ollama instance as the foreground client.
+        # num_ctx is kept small (512) so gemma2:2b's KV cache stays
+        # tiny and both models remain resident in VRAM simultaneously.
         self.bg_model = os.getenv("BG_LLM_MODEL", "gemma2:2b")
-        bg_host = os.getenv("OLLAMA_BG_HOST", "http://127.0.0.1:11435")
+        self.bg_num_ctx = int(os.getenv("OLLAMA_BG_NUM_CTX", "512"))
+        bg_host = os.getenv("OLLAMA_BG_HOST", "http://127.0.0.1:11434")
         self.bg_client = ollama.Client(host=bg_host)
 
         logger.info(
             (
                 "LLMService initialised | fg_model=%s | fg_host=%s | "
-                "bg_model=%s | bg_host=%s | temperature=%s | "
+                "bg_model=%s | bg_host=%s | bg_num_ctx=%s | temperature=%s | "
                 "top_p=%s | repeat_penalty=%s | streaming=%s"
             ),
             self.model,
             fg_host,
             self.bg_model,
             bg_host,
+            self.bg_num_ctx,
             self.temperature,
             self.top_p,
             self.repeat_penalty,
@@ -127,6 +141,12 @@ class LLMService:
             "repeat_penalty": self.repeat_penalty,
         }
 
+    def _background_options(self, temperature: float) -> Dict:
+        return {
+            "temperature": temperature,
+            "num_ctx": self.bg_num_ctx,
+        }
+
     def build_messages(
         self,
         user_message: str,
@@ -137,6 +157,7 @@ class LLMService:
         recall_clarification_question: str = "",
         fresh_teach_topic: str = "",
         emotion_instruction: str = "",
+        pending_topics: Optional[List[str]] = None,
     ) -> List[Dict[str, str]]:
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": AI_TEACHER_SYSTEM_PROMPT},
@@ -167,6 +188,37 @@ class LLMService:
                     ),
                 }
             )
+
+        # ── Pending topics from earlier interruptions ─────────────
+        if pending_topics:
+            if len(pending_topics) == 1:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "Pending topic note:\n"
+                            f"The student previously interrupted you while you were explaining: \"{pending_topics[0]}\".\n"
+                            "After answering the student's current message, naturally ask if they would like to "
+                            "continue with that topic or talk about something else.\n"
+                            "Keep it short and conversational. Do not force it."
+                        ),
+                    }
+                )
+            else:
+                topic_list = "\n".join(f"- {t}" for t in pending_topics)
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "Pending topics note:\n"
+                            "The student interrupted you on multiple occasions. The following topics were left unfinished:\n"
+                            f"{topic_list}\n\n"
+                            "After answering the student's current message, naturally mention these pending topics "
+                            "and ask if they would like to continue with any of them or talk about something else.\n"
+                            "Keep it short and conversational. Do not force it."
+                        ),
+                    }
+                )
 
         if recall_clarification_mode:
             clarification_parts: List[str] = [
@@ -256,10 +308,12 @@ class LLMService:
         messages.append({"role": "user", "content": user_message})
 
         logger.info(
-            "Final LLM prompt built | total_messages=%s | recalled_memory=%s | clarification_mode=%s | current_user_chars=%s",
+            "Final LLM prompt built | total_messages=%s | recalled_memory=%s | "
+            "clarification_mode=%s | pending_topics=%s | current_user_chars=%s",
             len(messages),
             bool(recalled_memory),
             recall_clarification_mode,
+            len(pending_topics) if pending_topics else 0,
             len(user_message),
         )
         return messages
@@ -278,6 +332,7 @@ class LLMService:
         recall_clarification_question: str = "",
         fresh_teach_topic: str = "",
         emotion_instruction: str = "",
+        pending_topics: Optional[List[str]] = None,
     ) -> str:
         messages = self.build_messages(
             user_message=user_message,
@@ -288,6 +343,7 @@ class LLMService:
             recall_clarification_question=recall_clarification_question,
             fresh_teach_topic=fresh_teach_topic,
             emotion_instruction=emotion_instruction,
+            pending_topics=pending_topics,
         )
 
         response = self.fg_client.chat(
@@ -309,6 +365,7 @@ class LLMService:
         recall_clarification_question: str = "",
         fresh_teach_topic: str = "",
         emotion_instruction: str = "",
+        pending_topics: Optional[List[str]] = None,
     ) -> Iterator[str]:
         if not self.enable_streaming:
             yield self.generate(
@@ -320,6 +377,7 @@ class LLMService:
                 recall_clarification_question=recall_clarification_question,
                 fresh_teach_topic=fresh_teach_topic,
                 emotion_instruction=emotion_instruction,
+                pending_topics=pending_topics,
             )
             return
 
@@ -332,6 +390,7 @@ class LLMService:
             recall_clarification_question=recall_clarification_question,
             fresh_teach_topic=fresh_teach_topic,
             emotion_instruction=emotion_instruction,
+            pending_topics=pending_topics,
         )
 
         logger.info("Foreground stream_generate started.")
@@ -353,7 +412,7 @@ class LLMService:
             logger.info("Foreground stream_generate completed.")
 
     # ─────────────────────────────────────────────────────────────────
-    # BACKGROUND — runs on CPU Ollama instance (port 11435)
+    # BACKGROUND — runs on GPU Ollama instance (same port 11434)
     # ─────────────────────────────────────────────────────────────────
 
     def structured_chat(
@@ -365,14 +424,17 @@ class LLMService:
     ) -> Optional[BaseModel]:
         """Structured call for background services.
 
-        Runs on the separate CPU Ollama instance so it never blocks
-        foreground teacher responses.
+        Runs gemma2:2b on the same GPU Ollama instance as the foreground
+        model.  num_ctx is kept at 512 (OLLAMA_BG_NUM_CTX) so gemma's
+        KV cache stays small (~26 MiB vs ~416 MiB at 4096 ctx) and both
+        models remain resident in VRAM without evicting each other.
         """
         try:
             logger.info(
-                "Background structured_chat started | schema=%s | model=%s",
+                "Background structured_chat started | schema=%s | model=%s | num_ctx=%s",
                 schema_model.__name__,
                 self.bg_model,
+                self.bg_num_ctx,
             )
             response = self.bg_client.chat(
                 model=self.bg_model,
@@ -381,7 +443,7 @@ class LLMService:
                     {"role": "user", "content": user_prompt},
                 ],
                 stream=False,
-                options={"temperature": temperature},
+                options=self._background_options(temperature),
                 format=schema_model.model_json_schema(),
             )
             logger.info(

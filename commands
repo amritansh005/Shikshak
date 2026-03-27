@@ -27,6 +27,7 @@ Start OLLAMA:
 cd "C:\Users\DELL\Desktop\Shikshak\Techer_llm"
 conda activate ai-teacher
 ollama pull nomic-embed-text
+Run once to set the limit to 2- Add-Content $PROFILE "`n`$env:OLLAMA_MAX_LOADED_MODELS = '2'"
 ollama serve
 
 .\start_bg_ollama.ps1
