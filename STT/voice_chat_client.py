@@ -738,16 +738,59 @@ def finalize_turn(
                 _prefix_text = state.pending_interruption_prefix
 
         if _prefix_text:
-            # Only prepend if the final text doesn't already start
-            # with the same words (avoid duplication when ASR
-            # captured overlapping audio).
-            prefix_lower = _prefix_text.lower().split()
-            final_lower = final_text.lower().split()
+            # Only prepend if the final text doesn't already contain
+            # the same words (avoid duplication when ASR captured
+            # overlapping audio).
+            import re as _re
+
+            def _normalise_words(text: str) -> list[str]:
+                """Lowercase, strip punctuation, expand common contractions."""
+                _CONTRACTIONS = {
+                    "i'm": "i am", "don't": "do not", "can't": "cannot",
+                    "won't": "will not", "it's": "it is", "that's": "that is",
+                    "let's": "let us", "we're": "we are", "they're": "they are",
+                    "you're": "you are", "i've": "i have", "we've": "we have",
+                    "they've": "they have", "i'll": "i will", "we'll": "we will",
+                    "isn't": "is not", "aren't": "are not", "wasn't": "was not",
+                    "weren't": "were not", "didn't": "did not", "doesn't": "does not",
+                    "couldn't": "could not", "shouldn't": "should not",
+                    "wouldn't": "would not", "hasn't": "has not", "haven't": "have not",
+                }
+                words = []
+                for w in text.lower().split():
+                    w_clean = _re.sub(r"[^\w']", "", w)  # keep apostrophes for contractions
+                    expanded = _CONTRACTIONS.get(w_clean, w_clean)
+                    words.extend(expanded.split())
+                return [w for w in words if w]  # drop empties
+
+            prefix_norm = _normalise_words(_prefix_text)
+            final_norm = _normalise_words(final_text)
+
+            # Check 1: final text starts with prefix (original check)
             already_present = (
-                len(prefix_lower) > 0
-                and len(final_lower) >= len(prefix_lower)
-                and final_lower[:len(prefix_lower)] == prefix_lower
+                len(prefix_norm) > 0
+                and len(final_norm) >= len(prefix_norm)
+                and final_norm[:len(prefix_norm)] == prefix_norm
             )
+
+            # Check 2: prefix appears as a contiguous subsequence anywhere
+            # in the final text (handles leading filler words like "um", "so")
+            if not already_present and len(prefix_norm) > 0:
+                plen = len(prefix_norm)
+                for i in range(len(final_norm) - plen + 1):
+                    if final_norm[i:i + plen] == prefix_norm:
+                        already_present = True
+                        break
+
+            # Check 3: high word-overlap ratio (handles minor ASR rewording)
+            if not already_present and len(prefix_norm) >= 3:
+                prefix_set = set(prefix_norm)
+                final_set = set(final_norm)
+                overlap = len(prefix_set & final_set)
+                ratio = overlap / len(prefix_set) if prefix_set else 0.0
+                if ratio >= 0.8:
+                    already_present = True
+
             if not already_present and _prefix_text:
                 combined = f"{_prefix_text} {final_text}"
                 logger.info(
