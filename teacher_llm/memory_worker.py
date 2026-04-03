@@ -1,20 +1,23 @@
 """
-Memory Card Worker
-──────────────────
-Runs as a SEPARATE process from the chat loop.
+Memory Card Worker  (OPTIONAL — legacy fallback)
+─────────────────────────────────────────────────
+With the single-model strategy, memory card extraction now happens
+INLINE inside the /chat endpoint (using the foreground Gemma 4b model
+during TTS playback).  You do NOT need to run this worker anymore.
 
-Polls SQLite for unprocessed student-teacher turns, extracts memory
-cards using gemma2:2b on the CPU Ollama instance (port 11435), and
-marks them done.
+However, it still works as a safety-net:
+  - If the inline extraction was cancelled (student interrupted quickly)
+    the messages stay unprocessed in SQLite (memory_extracted = 0).
+  - Running this worker will eventually pick them up and extract cards
+    from the same Gemma model.
 
-No turn is ever skipped — the worker just processes them one by one
-at its own pace, regardless of how fast the student types.
+If you want belt-and-suspenders, run it.  Otherwise, skip it.
 
 Usage:
     python memory_worker.py
 
 Requires:
-    - CPU Ollama running on port 11435 (start_bg_ollama.ps1)
+    - Ollama running on port 11434 (same instance as the teacher)
     - uvicorn app server running (for log forwarding)
 """
 

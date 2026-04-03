@@ -58,6 +58,12 @@ class Settings:
 
     teacher_chat_url: str = os.getenv("VOICE_CHAT_TEACHER_URL", "http://127.0.0.1:8000/chat")
 
+    # ── Emotion display/debug output ───────────────────────────────
+    # If true, prints per-turn emotion summary in terminal output:
+    #   [text: ... | voice: ... | rate: ... | pauses: ...]
+    # Keep false to avoid showing emotion labels in chat-like output.
+    show_emotion_in_chat: bool = os.getenv("SHOW_EMOTION_IN_CHAT", "false").lower() == "true"
+
     # ── Speaker Verification ──────────────────────────────────────
     speaker_verification_enabled: bool = os.getenv("SPEAKER_VERIFICATION_ENABLED", "true").lower() == "true"
     speaker_verification_threshold: float = float(os.getenv("SPEAKER_VERIFICATION_THRESHOLD", "0.75"))

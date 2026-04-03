@@ -911,10 +911,11 @@ def finalize_turn(
 
         print(" " * 160, end="\r")
         print(f"You: {final_text}", flush=True)
-        print(
-            f"  [text: {text_emotion['label']} | voice: {audio_emotion['label']} ({audio_emotion['confidence']:.0%}) | rate: {prosody.speech_rate_syllables_per_sec:.1f} sps | pauses: {prosody.pause_ratio:.0%}]",
-            flush=True,
-        )
+        if settings.show_emotion_in_chat:
+            print(
+                f"  [text: {text_emotion['label']} | voice: {audio_emotion['label']} ({audio_emotion['confidence']:.0%}) | rate: {prosody.speech_rate_syllables_per_sec:.1f} sps | pauses: {prosody.pause_ratio:.0%}]",
+                flush=True,
+            )
         if interruption_meta:
             print(
                 f"  [interruption: yes | reason: {interruption_meta.get('reason', 'unknown')}]",
@@ -942,6 +943,21 @@ def finalize_turn(
                 )
             else:
                 _tts_client.speak_neutral(teacher_text, session_id=session_id)
+
+        # ── Trigger memory card extraction AFTER TTS finishes ────────
+        # Fire-and-forget: runs in a daemon thread so it doesn't block
+        # the finally cleanup.  The teacher server runs the actual
+        # extraction in its own background thread and returns immediately.
+        # This avoids GPU contention between Gemma (Ollama) and Kokoro
+        # (TTS) since both share the same CUDA device.
+        def _trigger_memory_card() -> None:
+            try:
+                _mc_url = settings.teacher_chat_url.rsplit("/chat", 1)[0] + "/extract_memory_card"
+                requests.post(_mc_url, json={"session_id": session_id}, timeout=10)
+            except Exception:
+                logger.debug("Memory card extraction trigger failed (non-critical)")
+
+        threading.Thread(target=_trigger_memory_card, daemon=True, name="mc-trigger").start()
 
     finally:
         if _resume_handled_cleanup:

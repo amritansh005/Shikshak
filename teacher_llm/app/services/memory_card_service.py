@@ -83,6 +83,144 @@ class MemoryCardService:
             return
         self._extract_and_store(session_id, messages)
 
+    def extract_and_store_inline(self, session_id: str) -> None:
+        """Inline extraction using the FOREGROUND model (Gemma 4b).
+
+        Called from a background thread in the /chat endpoint right after
+        the teacher response is generated.  Runs while TTS is playing so
+        the GPU is otherwise idle.
+
+        Uses llm.foreground_structured_chat() which:
+          - acquires fg_model_lock (serialises with teacher generate)
+          - checks _memory_card_cancel before/after Ollama call
+          - aborts immediately if a new turn arrives
+
+        The embedding step also checks cancellation so we don't waste
+        time on DB writes when the model is needed urgently.
+        """
+        latest_messages = self.memory.get_latest_n_messages_from_sqlite(session_id, 4)
+        if len(latest_messages) < 2:
+            return
+
+        formatted = self._format_messages(latest_messages)
+
+        logger.info(
+            "\n"
+            "┌─ Inline Memory Extraction Started (fg model) ───────────\n"
+            "│  session_id : %s\n"
+            "│  messages   : %d\n"
+            "│  exchange   :\n%s\n"
+            "└─────────────────────────────────────────────────────────",
+            session_id,
+            len(latest_messages),
+            "\n".join(f"│    {line}" for line in formatted.splitlines()),
+        )
+
+        user_prompt = f"""
+Latest messages:
+{formatted}
+
+Extract a memory card for this exchange.
+
+Create memory (should_create_memory=true) ONLY if real teaching content was exchanged — a concept explained, a question answered with substance, a fact given, or a confusion addressed.
+
+Skip (should_create_memory=false) if this is a greeting, small talk, topic suggestion with no explanation, or filler with no actual learning content.
+""".strip()
+
+        # ── Use FOREGROUND model with cancellation support ───────────
+        parsed = self.llm.foreground_structured_chat(
+            system_prompt=MEMORY_EXTRACTION_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            schema_model=MemoryCardExtractionSchema,
+            temperature=0.1,
+        )
+
+        if not parsed:
+            logger.info("Inline memory extraction returned nothing (possibly cancelled).")
+            return
+
+        if not parsed.should_create_memory:
+            if self._looks_like_teaching_exchange(latest_messages):
+                logger.info(
+                    "LLM declined memory creation, but teaching-exchange heuristic triggered. Creating fallback memory card."
+                )
+                parsed = self._build_fallback_memory(latest_messages)
+            else:
+                logger.info(
+                    "\n"
+                    "┌─ Inline Memory Card Skipped ────────────────────────────\n"
+                    "│  reason : LLM decided no educational content\n"
+                    "└─────────────────────────────────────────────────────────"
+                )
+                # Still mark as extracted so memory_worker doesn't retry.
+                max_id = max(m["id"] for m in latest_messages)
+                self.memory.mark_turn_as_extracted(up_to_message_id=max_id)
+                return
+
+        logger.info(
+            "\n"
+            "┌─ Inline Memory Card Extracted ──────────────────────────\n"
+            "│  topic          : %s\n"
+            "│  status         : %s\n"
+            "│  snippet        : %s\n"
+            "└─────────────────────────────────────────────────────────",
+            parsed.topic or "(empty)",
+            parsed.status or "(empty)",
+            (parsed.snippet or "(empty)")[:120],
+        )
+
+        retrieval_text = (parsed.retrieval_text or "").strip()
+        if not retrieval_text:
+            retrieval_text = self._build_retrieval_text(parsed)
+
+        if not retrieval_text:
+            logger.info("Inline memory card skipped — retrieval_text empty after rebuild.")
+            return
+
+        # ── Check cancellation before embedding (avoid wasting time) ─
+        if self.llm._memory_card_cancel.is_set():
+            logger.info("Inline memory card aborted before embedding — new turn arrived.")
+            return
+
+        embedding = self.embedding_service.embed_text(retrieval_text)
+        if not embedding:
+            logger.warning("Inline memory card failed — could not create embedding.")
+            return
+
+        # ── Check cancellation before DB writes ──────────────────────
+        if self.llm._memory_card_cancel.is_set():
+            logger.info("Inline memory card aborted before DB write — new turn arrived.")
+            return
+
+        self.memory.save_memory_card(
+            session_id=session_id,
+            topic=parsed.topic,
+            confusion=parsed.confusion,
+            helpful_example=parsed.helpful_example,
+            student_preference=parsed.student_preference,
+            status=parsed.status,
+            snippet=parsed.snippet,
+            retrieval_text=retrieval_text,
+            embedding=embedding,
+        )
+
+        # Mark messages as extracted so memory_worker (if running as
+        # fallback) doesn't double-process them.
+        max_id = max(m["id"] for m in latest_messages)
+        self.memory.mark_turn_as_extracted(up_to_message_id=max_id)
+
+        logger.info(
+            "\n"
+            "┌─ Inline Memory Card Stored ✓ ───────────────────────────\n"
+            "│  topic          : %s\n"
+            "│  status         : %s\n"
+            "│  retrieval_text : %s\n"
+            "└─────────────────────────────────────────────────────────",
+            parsed.topic or "(empty)",
+            parsed.status or "(empty)",
+            retrieval_text[:120],
+        )
+
     def _extract_and_store(self, session_id: str, messages: List[dict]) -> None:
         """Shared extraction logic used by both entry points."""
         formatted = self._format_messages(messages)

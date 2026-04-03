@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import threading
 from typing import Dict, Iterator, List, Optional, Type
 
 import ollama
@@ -13,32 +14,25 @@ from pydantic import BaseModel
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Single-instance Ollama strategy (GPU)
-# ──────────────────────────────────────
-# Both foreground and background clients point to the SAME Ollama
-# instance (port 11434, GPU).  OLLAMA_MAX_LOADED_MODELS=2 must be set
-# before starting Ollama so both models stay resident in VRAM:
+# Single-model Ollama strategy (GPU)
+# ───────────────────────────────────
+# One model (gemma3:4b) handles EVERYTHING:
+#   • Teacher responses (generate / stream_generate)
+#   • Recall decisions, summary updates (structured_chat via bg_client)
+#   • Memory card extraction (foreground_structured_chat — runs during
+#     TTS playback while the model is otherwise idle)
 #
-#   $env:OLLAMA_MAX_LOADED_MODELS = "2"; ollama serve
+# Only ONE Ollama instance is needed (port 11434).
+# OLLAMA_MAX_LOADED_MODELS=1 is sufficient.
 #
-#   Instance (GPU, port 11434):
-#     • stream_generate() / generate() — foreground teacher responses.
-#       Runs qwen2.5:3b on GPU for fast, low-latency answers.
-#     • structured_chat() — background tasks like memory-card extraction,
-#       recall decisions, summary generation, etc.
-#       Runs gemma2:2b on GPU with a small num_ctx (512) so its KV cache
-#       stays tiny and both models fit comfortably in 6 GiB VRAM.
+# Memory card extraction is triggered INLINE after the teacher response
+# is generated, while TTS is playing.  A threading.Event
+# (_memory_card_cancel) lets the next teacher turn abort an in-flight
+# extraction so the model is immediately available.
 #
-# VRAM budget (approximate, num_ctx=4096 for qwen, 512 for gemma):
-#   qwen2.5:3b  weights ~1.8 GiB  +  KV ~144 MiB  +  compute ~301 MiB
-#   gemma2:2b   weights ~1.5 GiB  +  KV  ~26 MiB  +  compute ~505 MiB
-#   ─────────────────────────────────────────────────────────────────
-#   Total                                              ≈ 4.3 GiB  ✅
-#
-# Memory card extraction is handled by a SEPARATE worker process
-# (memory_worker.py) that reads unprocessed turns from SQLite and
-# sends them to the background model.  The chat loop therefore never
-# blocks on memory cards no matter how fast the student types.
+# The bg_client / bg_model are kept as config aliases pointing to the
+# SAME model so recall_service and summary_service continue to work
+# unchanged (they call structured_chat / bg_client.chat directly).
 
 AI_TEACHER_SYSTEM_PROMPT = """
 You are an excellent teacher.
@@ -108,14 +102,27 @@ class LLMService:
         fg_host = os.getenv("OLLAMA_FG_HOST", "http://127.0.0.1:11434")
         self.fg_client = ollama.Client(host=fg_host)
 
-        # ── Background (GPU, same instance) ──────────────────────────
-        # Points to the same Ollama instance as the foreground client.
-        # num_ctx is kept small (512) so gemma2:2b's KV cache stays
-        # tiny and both models remain resident in VRAM simultaneously.
-        self.bg_model = os.getenv("BG_LLM_MODEL", "gemma2:2b")
+        # ── Background (same model, same instance) ───────────────────
+        # bg_model now defaults to the SAME model as the foreground.
+        # This eliminates the need for a second model in VRAM.
+        # bg_client still exists as an alias so recall_service and
+        # summary_service keep working without changes.
+        self.bg_model = os.getenv("BG_LLM_MODEL", self.model)
         self.bg_num_ctx = int(os.getenv("OLLAMA_BG_NUM_CTX", "512"))
-        bg_host = os.getenv("OLLAMA_BG_HOST", "http://127.0.0.1:11434")
+        bg_host = os.getenv("OLLAMA_BG_HOST", fg_host)
         self.bg_client = ollama.Client(host=bg_host)
+
+        # ── Foreground model lock ────────────────────────────────────
+        # Serialises access to the foreground model so that memory card
+        # extraction (running during TTS) and the next teacher response
+        # never race on the same Ollama model.
+        self.fg_model_lock = threading.Lock()
+
+        # ── Memory card cancellation ─────────────────────────────────
+        # Set by the /chat endpoint when a new turn arrives.  The
+        # inline memory card extraction checks this BEFORE calling
+        # Ollama; if set, it aborts immediately so Gemma is free.
+        self._memory_card_cancel = threading.Event()
 
         logger.info(
             (
@@ -145,6 +152,7 @@ class LLMService:
         return {
             "temperature": temperature,
             "num_ctx": self.bg_num_ctx,
+            "num_predict": 512,
         }
 
     def build_messages(
@@ -334,6 +342,10 @@ class LLMService:
         emotion_instruction: str = "",
         pending_topics: Optional[List[str]] = None,
     ) -> str:
+        # Signal any in-flight memory card extraction to abort, then
+        # wait for the lock so we don't overlap on the same model.
+        self._memory_card_cancel.set()
+
         messages = self.build_messages(
             user_message=user_message,
             history_messages=history_messages,
@@ -346,12 +358,18 @@ class LLMService:
             pending_topics=pending_topics,
         )
 
-        response = self.fg_client.chat(
-            model=self.model,
-            messages=messages,
-            stream=False,
-            options=self._foreground_options(),
-        )
+        with self.fg_model_lock:
+            # Clear the cancel flag now that WE hold the lock — the
+            # next memory card extraction (after this turn) should
+            # start with a clean slate.
+            self._memory_card_cancel.clear()
+
+            response = self.fg_client.chat(
+                model=self.model,
+                messages=messages,
+                stream=False,
+                options=self._foreground_options(),
+            )
 
         return response["message"]["content"].strip()
 
@@ -381,6 +399,9 @@ class LLMService:
             )
             return
 
+        # Signal any in-flight memory card extraction to abort.
+        self._memory_card_cancel.set()
+
         messages = self.build_messages(
             user_message=user_message,
             history_messages=history_messages,
@@ -394,22 +415,24 @@ class LLMService:
         )
 
         logger.info("Foreground stream_generate started.")
-        try:
-            stream = self.fg_client.chat(
-                model=self.model,
-                messages=messages,
-                stream=True,
-                options=self._foreground_options(),
-            )
+        with self.fg_model_lock:
+            self._memory_card_cancel.clear()
+            try:
+                stream = self.fg_client.chat(
+                    model=self.model,
+                    messages=messages,
+                    stream=True,
+                    options=self._foreground_options(),
+                )
 
-            for chunk in stream:
-                content = chunk.get("message", {}).get("content", "")
-                if not content:
-                    continue
-                yield content
+                for chunk in stream:
+                    content = chunk.get("message", {}).get("content", "")
+                    if not content:
+                        continue
+                    yield content
 
-        finally:
-            logger.info("Foreground stream_generate completed.")
+            finally:
+                logger.info("Foreground stream_generate completed.")
 
     # ─────────────────────────────────────────────────────────────────
     # BACKGROUND — runs on GPU Ollama instance (same port 11434)
@@ -422,12 +445,10 @@ class LLMService:
         schema_model: Type[BaseModel],
         temperature: float = 0.1,
     ) -> Optional[BaseModel]:
-        """Structured call for background services.
+        """Structured call for lightweight background services (recall, summary).
 
-        Runs gemma2:2b on the same GPU Ollama instance as the foreground
-        model.  num_ctx is kept at 512 (OLLAMA_BG_NUM_CTX) so gemma's
-        KV cache stays small (~26 MiB vs ~416 MiB at 4096 ctx) and both
-        models remain resident in VRAM without evicting each other.
+        Uses bg_client which now points to the SAME model as the foreground.
+        Kept separate so recall_service / summary_service work unchanged.
         """
         try:
             logger.info(
@@ -460,3 +481,108 @@ class LLMService:
         except Exception as e:
             logger.warning("structured_chat failed | error=%s", e)
             return None
+
+    # ─────────────────────────────────────────────────────────────────
+    # MEMORY CARD EXTRACTION — runs on foreground model during TTS
+    # ─────────────────────────────────────────────────────────────────
+
+    def cancel_memory_card_extraction(self) -> None:
+        """Signal any in-flight memory card extraction to abort.
+
+        Called by the /chat endpoint as soon as a new student turn arrives,
+        BEFORE acquiring fg_model_lock.  If a memory card extraction is
+        currently running (or about to call Ollama), it will see the cancel
+        event and bail out immediately, releasing the lock.
+        """
+        self._memory_card_cancel.set()
+        logger.info("Memory card cancellation requested.")
+
+    def foreground_structured_chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        schema_model: Type[BaseModel],
+        temperature: float = 0.1,
+    ) -> Optional[BaseModel]:
+        """Structured call that runs on the FOREGROUND model (Gemma 4b).
+
+        Used for memory card extraction during TTS playback.
+        Acquires fg_model_lock so it serialises with teacher response
+        generation.  Checks _memory_card_cancel before and after the
+        Ollama call — if a new turn has arrived, it aborts to free the
+        model.
+        """
+        # ── Check cancellation before even trying to acquire lock ────
+        if self._memory_card_cancel.is_set():
+            logger.info(
+                "foreground_structured_chat skipped (cancelled before lock) | schema=%s",
+                schema_model.__name__,
+            )
+            return None
+
+        acquired = self.fg_model_lock.acquire(timeout=30)
+        if not acquired:
+            logger.warning(
+                "foreground_structured_chat timed out waiting for fg_model_lock | schema=%s",
+                schema_model.__name__,
+            )
+            return None
+
+        try:
+            # ── Re-check cancellation after acquiring lock ───────────
+            if self._memory_card_cancel.is_set():
+                logger.info(
+                    "foreground_structured_chat skipped (cancelled after lock) | schema=%s",
+                    schema_model.__name__,
+                )
+                return None
+
+            logger.info(
+                "foreground_structured_chat started | schema=%s | model=%s",
+                schema_model.__name__,
+                self.model,
+            )
+
+            response = self.fg_client.chat(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                stream=False,
+                options={
+                    "temperature": temperature,
+                    "num_ctx": self.bg_num_ctx,
+                    "num_predict": 512,  # enough for structured JSON output
+                },
+                format=schema_model.model_json_schema(),
+            )
+
+            # ── Check cancellation after Ollama returns ──────────────
+            # If cancelled while Ollama was running, discard the result
+            # so the caller doesn't do unnecessary post-processing
+            # (embedding, DB writes) while the next turn is waiting.
+            if self._memory_card_cancel.is_set():
+                logger.info(
+                    "foreground_structured_chat result discarded (cancelled during inference) | schema=%s",
+                    schema_model.__name__,
+                )
+                return None
+
+            logger.info(
+                "foreground_structured_chat completed | schema=%s",
+                schema_model.__name__,
+            )
+
+            raw = response.get("message", {}).get("content", "").strip()
+            if not raw:
+                return None
+
+            data = json.loads(raw)
+            return schema_model(**data)
+
+        except Exception as e:
+            logger.warning("foreground_structured_chat failed | error=%s", e)
+            return None
+        finally:
+            self.fg_model_lock.release()

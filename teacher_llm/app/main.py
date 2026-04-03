@@ -11,6 +11,7 @@ from app.services.chat_memory import ChatMemoryService
 from app.services.embedding_service import EmbeddingService
 from app.services.emotion_state_service import EmotionStateService
 from app.services.llm_service import LLMService
+from app.services.memory_card_service import MemoryCardService
 from app.services.recall_service import RecallService
 from app.services.summary_service import SummaryService
 
@@ -23,6 +24,7 @@ _summary_service: Optional[SummaryService] = None
 _embedding_service: Optional[EmbeddingService] = None
 _recall_service: Optional[RecallService] = None
 _emotion_state: Optional[EmotionStateService] = None
+_memory_card_service: Optional[MemoryCardService] = None
 _summary_lock = threading.Lock()
 
 
@@ -192,7 +194,7 @@ def _has_explicit_recall_cue(message: str) -> bool:
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     global _llm, _memory, _summary_service, _embedding_service
-    global _recall_service, _emotion_state
+    global _recall_service, _emotion_state, _memory_card_service
 
     logger.info("Initialising shared services...")
     _llm = LLMService()
@@ -205,18 +207,19 @@ async def lifespan(application: FastAPI):
         embedding_service=_embedding_service,
     )
     _emotion_state = EmotionStateService()
+    _memory_card_service = MemoryCardService(
+        llm=_llm,
+        memory=_memory,
+        embedding_service=_embedding_service,
+    )
 
-    logger.info("Warming up models...")
+    logger.info("Warming up model...")
     try:
         _llm.fg_client.chat(model=_llm.model, messages=[{"role": "user", "content": "hi"}])
     except Exception as exc:
-        logger.warning("Foreground model warmup failed | error=%s", exc)
-    try:
-        _llm.bg_client.chat(model=_llm.bg_model, messages=[{"role": "user", "content": "hi"}])
-    except Exception as exc:
-        logger.warning("Background model warmup failed | error=%s", exc)
+        logger.warning("Model warmup failed | error=%s", exc)
 
-    logger.info("Models warmed up. AI Teacher API is ready.")
+    logger.info("Model warmed up. AI Teacher API is ready.")
     yield
     logger.info("Shutting down AI Teacher API.")
 
@@ -266,6 +269,14 @@ def chat(req: ChatRequest) -> ChatResponse:
         "New student message received | session_id=%s | text=%r",
         session_id, user_input,
     )
+
+    # ─────────────────────────────────────────────────────────────
+    # 0) Cancel any in-flight memory card extraction so Gemma is
+    #    free for THIS turn's teacher response.  The cancel signal
+    #    is checked inside foreground_structured_chat(); generate()
+    #    also sets it and waits for the fg_model_lock.
+    # ─────────────────────────────────────────────────────────────
+    _llm.cancel_memory_card_extraction()
 
     # Pull context early.
     conversation_summary = _memory.get_conversation_summary_for_prompt(session_id)
@@ -357,7 +368,7 @@ def chat(req: ChatRequest) -> ChatResponse:
         }
 
     # ─────────────────────────────────────────────────────────────
-    # 3) LLM generation
+    # 3) LLM generation (acquires fg_model_lock internally)
     # ─────────────────────────────────────────────────────────────
     full_response = _llm.generate(
         user_message=llm_user_message,
@@ -385,6 +396,14 @@ def chat(req: ChatRequest) -> ChatResponse:
 
     _snap_session = session_id
 
+    # ─────────────────────────────────────────────────────────────
+    # 4) Background tasks — fire and forget
+    #    Summary runs here.  Memory card extraction is NOT triggered
+    #    here — it runs AFTER TTS completes, triggered by a separate
+    #    /extract_memory_card call from voice_chat_client.  This
+    #    avoids GPU contention between Gemma and Kokoro TTS.
+    # ─────────────────────────────────────────────────────────────
+
     def _update_summary_background() -> None:
         if not _summary_lock.acquire(blocking=False):
             logger.info("Summary update skipped — previous update still running.")
@@ -404,3 +423,35 @@ def chat(req: ChatRequest) -> ChatResponse:
     threading.Thread(target=_update_summary_background, daemon=True).start()
 
     return ChatResponse(response=full_response, directive=directive_dict)
+
+
+class MemoryCardRequest(BaseModel):
+    session_id: str
+
+
+@app.post("/extract_memory_card")
+def extract_memory_card(req: MemoryCardRequest) -> dict:
+    """Trigger memory card extraction AFTER TTS finishes.
+
+    Called by voice_chat_client from a fire-and-forget thread once
+    TTS playback completes.  This avoids GPU contention between
+    Gemma (Ollama) and Kokoro (TTS) since both share the same CUDA device.
+
+    Runs in a background thread so the HTTP response returns immediately.
+    The cancellation mechanism still works: if a new /chat request
+    arrives, it calls cancel_memory_card_extraction() which aborts
+    the in-flight extraction.
+    """
+    session_id = req.session_id.strip()
+    if not session_id:
+        return {"ok": False, "reason": "empty session_id"}
+
+    def _do_extract() -> None:
+        try:
+            logger.info("Memory card extraction triggered (post-TTS) | session_id=%s", session_id)
+            _memory_card_service.extract_and_store_inline(session_id=session_id)
+        except Exception as exc:
+            logger.warning("Memory card extraction failed | session_id=%s | error=%s", session_id, exc)
+
+    threading.Thread(target=_do_extract, daemon=True, name="memory-card-post-tts").start()
+    return {"ok": True}

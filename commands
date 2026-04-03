@@ -10,7 +10,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8001
 python shikshak_desktop.py
 
 Teacher LLM:
-cd "C:\Users\DELL\Desktop\Shikshak\Techer_llm"
+cd "C:\Users\DELL\Desktop\Shikshak\teacher_llm"
 conda create -n ai-teacher python=3.10 -y
 conda activate ai-teacher (Python 3.10.20)
 python -m pip install --upgrade pip
