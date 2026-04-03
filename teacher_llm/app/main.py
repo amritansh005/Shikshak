@@ -394,33 +394,13 @@ def chat(req: ChatRequest) -> ChatResponse:
     _memory.save_message(session_id=session_id, role="assistant", content=full_response)
     logger.info("Current turn messages saved to Redis/SQLite.")
 
-    _snap_session = session_id
-
     # ─────────────────────────────────────────────────────────────
-    # 4) Background tasks — fire and forget
-    #    Summary runs here.  Memory card extraction is NOT triggered
-    #    here — it runs AFTER TTS completes, triggered by a separate
-    #    /extract_memory_card call from voice_chat_client.  This
-    #    avoids GPU contention between Gemma and Kokoro TTS.
+    # 4) NO background GPU tasks here.
+    #    Both summary update and memory card extraction run AFTER
+    #    TTS completes, triggered by /extract_memory_card from
+    #    voice_chat_client.  This avoids GPU contention between
+    #    Gemma (Ollama) and MeloTTS/OpenVoice (both on CUDA).
     # ─────────────────────────────────────────────────────────────
-
-    def _update_summary_background() -> None:
-        if not _summary_lock.acquire(blocking=False):
-            logger.info("Summary update skipped — previous update still running.")
-            return
-        try:
-            logger.info("Older conversation summary update started.")
-            _memory.update_older_conversation_summary(
-                session_id=_snap_session,
-                summary_service=_summary_service,
-            )
-            logger.info("Older conversation summary update completed.")
-        except Exception as exc:
-            logger.warning("Older conversation summary update failed | error=%s", exc)
-        finally:
-            _summary_lock.release()
-
-    threading.Thread(target=_update_summary_background, daemon=True).start()
 
     return ChatResponse(response=full_response, directive=directive_dict)
 
@@ -431,27 +411,48 @@ class MemoryCardRequest(BaseModel):
 
 @app.post("/extract_memory_card")
 def extract_memory_card(req: MemoryCardRequest) -> dict:
-    """Trigger memory card extraction AFTER TTS finishes.
+    """Trigger memory card extraction + summary update AFTER TTS finishes.
 
     Called by voice_chat_client from a fire-and-forget thread once
     TTS playback completes.  This avoids GPU contention between
-    Gemma (Ollama) and Kokoro (TTS) since both share the same CUDA device.
+    Gemma (Ollama) and MeloTTS/OpenVoice since both share the same
+    CUDA device.
 
-    Runs in a background thread so the HTTP response returns immediately.
+    Both tasks run sequentially in a single background thread:
+      1. Summary update (Gemma via bg_client)
+      2. Memory card extraction (Gemma via foreground_structured_chat)
+
     The cancellation mechanism still works: if a new /chat request
     arrives, it calls cancel_memory_card_extraction() which aborts
-    the in-flight extraction.
+    the in-flight memory card extraction.
     """
     session_id = req.session_id.strip()
     if not session_id:
         return {"ok": False, "reason": "empty session_id"}
 
-    def _do_extract() -> None:
+    def _do_post_tts_tasks() -> None:
+        # ── 1. Summary update ────────────────────────────────────
+        if _summary_lock.acquire(blocking=False):
+            try:
+                logger.info("Summary update started (post-TTS) | session_id=%s", session_id)
+                _memory.update_older_conversation_summary(
+                    session_id=session_id,
+                    summary_service=_summary_service,
+                )
+                logger.info("Summary update completed (post-TTS) | session_id=%s", session_id)
+            except Exception as exc:
+                logger.warning("Summary update failed | session_id=%s | error=%s", session_id, exc)
+            finally:
+                _summary_lock.release()
+        else:
+            logger.info("Summary update skipped — previous update still running.")
+
+        # ── 2. Memory card extraction ────────────────────────────
         try:
             logger.info("Memory card extraction triggered (post-TTS) | session_id=%s", session_id)
             _memory_card_service.extract_and_store_inline(session_id=session_id)
         except Exception as exc:
             logger.warning("Memory card extraction failed | session_id=%s | error=%s", session_id, exc)
 
-    threading.Thread(target=_do_extract, daemon=True, name="memory-card-post-tts").start()
+    threading.Thread(target=_do_post_tts_tasks, daemon=True, name="post-tts-tasks").start()
     return {"ok": True}

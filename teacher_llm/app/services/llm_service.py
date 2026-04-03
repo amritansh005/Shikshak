@@ -14,6 +14,74 @@ from pydantic import BaseModel
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+
+def _repair_and_parse_json(raw: str) -> Optional[dict]:
+    """Try to parse JSON, repairing common truncation issues.
+
+    Gemma occasionally produces truncated JSON (unterminated strings,
+    missing closing braces).  This helper tries progressively more
+    aggressive repairs before giving up.
+    """
+    raw = raw.strip()
+    if not raw:
+        return None
+
+    # Attempt 1: parse as-is
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 2: close any unterminated string and add missing braces
+    repaired = raw
+    # If the last non-whitespace char is not } or ], the JSON is truncated.
+    # Try closing open strings and adding missing braces.
+    # Count unmatched braces/brackets
+    open_braces = repaired.count("{") - repaired.count("}")
+    open_brackets = repaired.count("[") - repaired.count("]")
+
+    # Check if we're inside an unterminated string (odd number of unescaped quotes)
+    in_string = False
+    i = 0
+    while i < len(repaired):
+        c = repaired[i]
+        if c == "\\" and in_string:
+            i += 2  # skip escaped char
+            continue
+        if c == '"':
+            in_string = not in_string
+        i += 1
+
+    if in_string:
+        repaired += '"'
+
+    # Close open braces/brackets
+    repaired += "]" * max(0, open_brackets)
+    repaired += "}" * max(0, open_braces)
+
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 3: find the last complete key-value pair and truncate there
+    # Look for the last complete "key": "value" or "key": bool/number
+    last_comma = repaired.rfind(",")
+    if last_comma > 0:
+        truncated = repaired[:last_comma]
+        # Close any open structures
+        open_b = truncated.count("{") - truncated.count("}")
+        open_k = truncated.count("[") - truncated.count("]")
+        truncated += "]" * max(0, open_k)
+        truncated += "}" * max(0, open_b)
+        try:
+            return json.loads(truncated)
+        except json.JSONDecodeError:
+            pass
+
+    logger.warning("JSON repair failed | raw_tail=%r", raw[-100:])
+    return None
+
 # Single-model Ollama strategy (GPU)
 # ───────────────────────────────────
 # One model (gemma3:4b) handles EVERYTHING:
@@ -152,7 +220,7 @@ class LLMService:
         return {
             "temperature": temperature,
             "num_ctx": self.bg_num_ctx,
-            "num_predict": 512,
+            "num_predict": 1024,
         }
 
     def build_messages(
@@ -476,13 +544,14 @@ class LLMService:
             if not raw:
                 return None
 
-            data = json.loads(raw)
+            data = _repair_and_parse_json(raw)
+            if data is None:
+                logger.warning("structured_chat JSON parse failed after repair | raw_len=%d", len(raw))
+                return None
             return schema_model(**data)
         except Exception as e:
             logger.warning("structured_chat failed | error=%s", e)
             return None
-
-    # ─────────────────────────────────────────────────────────────────
     # MEMORY CARD EXTRACTION — runs on foreground model during TTS
     # ─────────────────────────────────────────────────────────────────
 
@@ -553,7 +622,7 @@ class LLMService:
                 options={
                     "temperature": temperature,
                     "num_ctx": self.bg_num_ctx,
-                    "num_predict": 512,  # enough for structured JSON output
+                    "num_predict": 1024,  # enough for structured JSON output
                 },
                 format=schema_model.model_json_schema(),
             )
@@ -578,7 +647,10 @@ class LLMService:
             if not raw:
                 return None
 
-            data = json.loads(raw)
+            data = _repair_and_parse_json(raw)
+            if data is None:
+                logger.warning("foreground_structured_chat JSON parse failed after repair | raw_len=%d", len(raw))
+                return None
             return schema_model(**data)
 
         except Exception as e:

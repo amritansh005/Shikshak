@@ -1,20 +1,13 @@
 """
-Chatterbox TTS synthesis engine.
+OpenVoice-lite TTS synthesis engine.
 
-Primary backend : Chatterbox-TTS (0.5B, MIT license) via `chatterbox-tts` pip package.
-                  Supports emotion exaggeration control, cfg_weight for pacing,
-                  and paralinguistic tags like [laugh], [cough].
+Primary backend: OpenVoice-compatible MeloTTS runtime (`melo.api.TTS`).
+This is lightweight compared to larger conversational TTS stacks and supports
+emotion expression through the existing prosody controller
+(rate/pitch/energy/pause shaping).
 
-Fallback backend: Kokoro-82M  (CPU-friendly, Apache 2.0, ~500 MB RAM).
-                  Auto-activated if chatterbox-tts fails to load (no GPU, missing pkg).
-
-Prosody is mapped from emotion states to Chatterbox parameters:
-  - exaggeration (0.0-1.5): emotion intensity
-  - cfg_weight   (0.0-1.0): speech pacing (lower=faster, higher=slower)
-  - temperature  (0.05-5.0): variation/creativity
-
-Post-processing rate/pitch adjustment via librosa (if installed)
-or a pure-numpy linear-resample fallback for rate only.
+Post-processing performs rate + pitch + energy adjustment via librosa (if
+installed), or numpy-only fallback for rate/energy.
 
 The engine is isolated from FastAPI — no imports from app.main.
 """
@@ -22,11 +15,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import io
 import logging
 import os
+import tempfile
 import time
 import wave
+import shutil
+import warnings
+from pathlib import Path
 from typing import AsyncGenerator, Optional
 
 import numpy as np
@@ -35,6 +33,70 @@ from app.config import settings
 from app.services.prosody_controller import ResolvedProsody, split_into_sentences
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_runtime_warning_filters() -> None:
+    """Reduce third-party startup warning noise for known non-actionable cases."""
+    # Runtime env knobs for noisy third-party libraries.
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+    os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+
+    warnings.filterwarnings(
+        "ignore",
+        message=r"pkg_resources is deprecated as an API.*",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"`resume_download` is deprecated.*",
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"You are using a Python version .* google\.api_core.*",
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"`torch\.nn\.utils\.weight_norm` is deprecated.*",
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"`huggingface_hub` cache-system uses symlinks by default.*",
+        category=UserWarning,
+    )
+
+    # Quiet noisy transformer logger warnings (e.g., unused checkpoint weights).
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+    logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+
+
+def _ensure_nltk_resources() -> None:
+    """
+    Ensure NLTK assets required by MeloTTS English text pipeline are present.
+    """
+    try:
+        import nltk  # type: ignore
+
+        required = [
+            ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng"),
+            ("taggers/averaged_perceptron_tagger", "averaged_perceptron_tagger"),
+            ("tokenizers/punkt", "punkt"),
+        ]
+
+        for nltk_path, package_name in required:
+            try:
+                nltk.data.find(nltk_path)
+            except LookupError:
+                logger.info("Downloading missing NLTK resource for TTS | %s", package_name)
+                nltk.download(package_name, quiet=True)
+    except Exception as exc:
+        logger.warning("Could not verify/download NLTK resources | %s", exc)
+
+
+# Apply warning filters as early as possible (before heavy optional imports)
+_configure_runtime_warning_filters()
 
 # ── Optional post-processing deps ────────────────────────────────────────────
 try:
@@ -93,8 +155,8 @@ def _apply_prosody_postprocess(
     """
     Post-synthesis rate + pitch adjustment.
 
-    Chatterbox handles most prosody via exaggeration/cfg_weight, so these
-    adjustments are a fine-tuning layer on top.
+    OpenVoice/Melo handles base synthesis; these are lightweight emotional
+    fine-tuning adjustments on top.
     """
     rate = prosody.rate_multiplier
     pitch_st = prosody.pitch_shift_st
@@ -114,6 +176,10 @@ def _apply_prosody_postprocess(
                 pitch_st,
             )
 
+    # Energy shaping (neutral baseline = 0.70 from prosody controller)
+    energy_gain = float(np.clip(prosody.energy_level / 0.70, 0.75, 1.35))
+    audio = np.clip(audio * energy_gain, -1.0, 1.0)
+
     return audio
 
 
@@ -126,78 +192,15 @@ def make_cache_key(text: str, state: str, trend: str, voice: str) -> str:
     return f"tts:cache:{digest}"
 
 
-# ── Emotion -> Chatterbox parameter mapping ──────────────────────────────────
-#
-# exaggeration: 0.3=neutral/professional, 0.5=balanced, 0.7+=expressive, 1.0+=dramatic
-# cfg_weight:   0.2-0.3=faster, 0.5=balanced, 0.7-0.8=slower/deliberate
-# temperature:  0.4-0.6=consistent, 0.8=balanced, 1.0+=creative
-
-_STATE_CHATTERBOX_PARAMS: dict[str, dict[str, float]] = {
-    "neutral":      {"exaggeration": 0.45, "cfg_weight": 0.50, "temperature": 0.7},
-    "frustrated":   {"exaggeration": 0.35, "cfg_weight": 0.65, "temperature": 0.6},
-    "confused":     {"exaggeration": 0.40, "cfg_weight": 0.60, "temperature": 0.6},
-    "anxious":      {"exaggeration": 0.35, "cfg_weight": 0.60, "temperature": 0.5},
-    "discouraged":  {"exaggeration": 0.50, "cfg_weight": 0.55, "temperature": 0.6},
-    "uncertain":    {"exaggeration": 0.40, "cfg_weight": 0.55, "temperature": 0.6},
-    "bored":        {"exaggeration": 0.70, "cfg_weight": 0.35, "temperature": 0.8},
-    "confident":    {"exaggeration": 0.55, "cfg_weight": 0.45, "temperature": 0.7},
-    "engaged":      {"exaggeration": 0.65, "cfg_weight": 0.45, "temperature": 0.8},
-    "curious":      {"exaggeration": 0.60, "cfg_weight": 0.40, "temperature": 0.8},
-}
-
-_TREND_EXAGG_DELTA: dict[str, float] = {
-    "escalating": -0.05,
-    "de-escalating": +0.05,
-    "recovering": +0.03,
-    "stable": 0.0,
-}
-
-_TREND_CFG_DELTA: dict[str, float] = {
-    "escalating": +0.05,
-    "de-escalating": -0.03,
-    "recovering": -0.02,
-    "stable": 0.0,
-}
-
-
-def _resolve_chatterbox_params(prosody: ResolvedProsody) -> dict[str, float]:
-    """Map resolved emotion state -> Chatterbox generate() kwargs."""
-    base = _STATE_CHATTERBOX_PARAMS.get(
-        prosody.resolved_state,
-        _STATE_CHATTERBOX_PARAMS["neutral"],
-    )
-    exagg_delta = _TREND_EXAGG_DELTA.get(prosody.resolved_trend, 0.0)
-    cfg_delta = _TREND_CFG_DELTA.get(prosody.resolved_trend, 0.0)
-
-    conf = prosody.smoothed_confidence
-    neutral = _STATE_CHATTERBOX_PARAMS["neutral"]
-
-    def _lerp(a: float, b: float, t: float) -> float:
-        return a + (b - a) * max(0.0, min(1.0, t))
-
-    return {
-        "exaggeration": max(0.25, min(1.5,
-            _lerp(neutral["exaggeration"], base["exaggeration"], conf) + exagg_delta
-        )),
-        "cfg_weight": max(0.0, min(1.0,
-            _lerp(neutral["cfg_weight"], base["cfg_weight"], conf) + cfg_delta
-        )),
-        "temperature": max(0.05, min(2.0,
-            _lerp(neutral["temperature"], base["temperature"], conf)
-        )),
-    }
-
-
 # ── Engine ────────────────────────────────────────────────────────────────────
 
 class TTSEngine:
     """
-    Chatterbox TTS engine with Kokoro fallback.
+    OpenVoice-lite (MeloTTS) engine.
 
     Backend priority:
-      1. chatterbox — Chatterbox-TTS (0.5B, MIT, CUDA)
-      2. kokoro     — Kokoro-82M (CPU-viable, Apache 2.0)
-      3. none       — both failed; RuntimeError on synthesize()
+      1. openvoice  — MeloTTS runtime used by OpenVoice ecosystem
+      2. none       — runtime unavailable; RuntimeError on synthesize()
     """
 
     def __init__(self) -> None:
@@ -210,20 +213,89 @@ class TTSEngine:
         device = settings.tts_device
         logger.info("Loading TTS model | device=%s", device)
         t0 = time.monotonic()
+        _configure_runtime_warning_filters()
+        _ensure_nltk_resources()
 
-        # ── Primary: Kokoro-82M on GPU ────────────────────────────
+        # MeloTTS imports Japanese text modules at import time and may require
+        # a valid MeCab rc path even for English usage. Auto-point to
+        # unidic_lite's mecabrc if available.
         try:
-            from kokoro import KPipeline, KModel
-            model = KModel().to(device).eval()
-            self._model = KPipeline(lang_code="a", model=model, device=device)
-            self._backend = "kokoro"
+            if "MECABRC" not in os.environ or not os.path.exists(os.environ.get("MECABRC", "")):
+                import unidic_lite  # type: ignore
+
+                dicdir = Path(unidic_lite.DICDIR)
+                mecabrc = dicdir / "mecabrc"
+                if mecabrc.exists():
+                    os.environ["MECABRC"] = str(mecabrc)
+                    os.environ["MECAB_ARGS"] = f'-r "{mecabrc}" -d "{dicdir}"'
+                    os.environ.setdefault("UNIDICDIR", str(dicdir))
+                    logger.info("Configured MECABRC for MeloTTS | %s", mecabrc)
+
+                    # Some Melo/MeCab builds still resolve to unidic.DICDIR.
+                    # If that path exists but is empty/missing mecabrc,
+                    # mirror unidic_lite dictionary there.
+                    try:
+                        import unidic  # type: ignore
+
+                        target_dicdir = Path(getattr(unidic, "DICDIR", ""))
+                        target_mecabrc = target_dicdir / "mecabrc"
+                        if target_dicdir and (not target_mecabrc.exists()):
+                            target_dicdir.mkdir(parents=True, exist_ok=True)
+                            for item in dicdir.iterdir():
+                                dst = target_dicdir / item.name
+                                if dst.exists():
+                                    continue
+                                if item.is_dir():
+                                    shutil.copytree(item, dst)
+                                else:
+                                    shutil.copy2(item, dst)
+                            logger.info("Mirrored unidic_lite dictionary to %s", target_dicdir)
+                    except Exception as mirror_exc:
+                        logger.warning("Could not mirror unidic_lite -> unidic path | %s", mirror_exc)
+        except Exception as exc:
+            logger.warning("Could not auto-configure MECABRC | %s", exc)
+
+        # ── Primary: OpenVoice-compatible MeloTTS runtime ─────────
+        try:
+            MeloTTS = None
+            import_errors: list[str] = []
+
+            # Canonical import path used by current MeloTTS builds
+            try:
+                from melo.api import TTS as MeloTTS  # type: ignore
+            except Exception as exc:
+                import_errors.append(f"melo.api: {exc}")
+
+            # Some installations expose a different top-level package name
+            if MeloTTS is None:
+                try:
+                    m = importlib.import_module("MeloTTS.melo.api")
+                    MeloTTS = getattr(m, "TTS")
+                except Exception as exc:
+                    import_errors.append(f"MeloTTS.melo.api: {exc}")
+
+            if MeloTTS is None:
+                raise ImportError(
+                    "Could not import MeloTTS runtime. "
+                    "Install in the same Python environment that runs uvicorn: "
+                    "pip install -r requirements.txt. "
+                    f"Tried imports -> {' | '.join(import_errors)}"
+                )
+
+            language = os.getenv("TTS_OPENVOICE_LANGUAGE", "EN")
+            model = MeloTTS(language=language, device=device)
+            self._model = model
+            self._backend = "openvoice"
             self._sample_rate = 24000
             logger.info(
-                "Kokoro-82M loaded | device=%s | sr=%d | elapsed=%.1fs",
-                device, self._sample_rate, time.monotonic() - t0,
+                "OpenVoice (MeloTTS) loaded | language=%s | device=%s | sr=%d | elapsed=%.1fs",
+                language,
+                device,
+                self._sample_rate,
+                time.monotonic() - t0,
             )
         except Exception as exc:
-            logger.error("Kokoro-82M load failed | error=%s", exc)
+            logger.error("OpenVoice (MeloTTS) load failed | error=%s", exc)
             self._backend = "none"
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -239,8 +311,8 @@ class TTSEngine:
 
         voice = voice or settings.default_voice
 
-        if self._backend == "kokoro":
-            audio = self._synthesize_kokoro(text, prosody, voice)
+        if self._backend == "openvoice":
+            audio = self._synthesize_openvoice(text, prosody, voice)
         else:
             raise RuntimeError(f"Unknown backend: {self._backend}")
 
@@ -298,94 +370,67 @@ class TTSEngine:
 
     # ── Backend implementations ───────────────────────────────────────────────
 
-    def _synthesize_chatterbox_turbo(
+    def _synthesize_openvoice(
         self,
         text: str,
         prosody: ResolvedProsody,
         voice: str,
     ) -> np.ndarray:
-        """
-        Synthesize using Chatterbox-TTS.
+        # OpenVoice's lightweight base TTS stack exposes speaker IDs via
+        # MeloTTS' hps.data.spk2id map.
+        speaker_map = getattr(getattr(self._model, "hps", None), "data", None)
+        spk2id = getattr(speaker_map, "spk2id", {}) if speaker_map is not None else {}
+        if not isinstance(spk2id, dict):
+            spk2id = {}
 
-        Emotion is controlled via exaggeration/cfg_weight/temperature
-        mapped from the student's emotional state.
-
-        The `voice` param can be a path to a .wav reference file for
-        voice cloning, or a name that maps to voices/<name>.wav.
-        """
-        _STATE_TEMPERATURE = {
-            "neutral": 0.8, "frustrated": 0.6, "confused": 0.6,
-            "anxious": 0.5, "discouraged": 0.7, "uncertain": 0.6,
-            "bored": 0.9, "confident": 0.8, "engaged": 0.9, "curious": 0.9,
-        }
-        temperature = _STATE_TEMPERATURE.get(prosody.resolved_state, 0.8)
-
-        logger.debug(
-            "Chatterbox-Turbo params | state=%s | temperature=%.2f",
-            prosody.resolved_state, temperature,
-        )
-
-        # Resolve voice reference audio (optional)
-        audio_prompt_path = None
-        if voice and os.path.isfile(voice):
-            audio_prompt_path = voice
-        elif voice and os.path.isfile(f"voices/{voice}.wav"):
-            audio_prompt_path = f"voices/{voice}.wav"
-
-        generate_kwargs = {
-            "text": text,
-            "temperature": temperature,
-        }
-        if audio_prompt_path:
-            generate_kwargs["audio_prompt_path"] = audio_prompt_path
-
-        wav_tensor = self._model.generate(**generate_kwargs)
-
-        # wav_tensor is a torch tensor [1, N] or [N]
-        if hasattr(wav_tensor, "numpy"):
-            audio = wav_tensor.squeeze().cpu().numpy()
-        else:
-            audio = np.array(wav_tensor, dtype=np.float32).squeeze()
-
-        audio = audio.astype(np.float32)
-
-        peak = np.abs(audio).max()
-        if peak > 0:
-            audio = audio / peak
-
-        return audio
-
-    def _synthesize_kokoro(
-        self,
-        text: str,
-        prosody: ResolvedProsody,
-        voice: str,
-    ) -> np.ndarray:
         _VOICE_MAP = {
-            "default":   "af_heart",
-            "serena":    "af_heart",
-            "vivian":    "af_sky",
-            "aiden":     "am_adam",
-            "dylan":     "am_michael",
-            "eric":      "am_echo",
-            "ryan":      "am_onyx",
+            "default": "EN-Default",
+            "serena": "EN-Default",
+            "aiden": "EN-US",
+            "vivian": "EN-BR",
         }
-        kokoro_voice = _VOICE_MAP.get(voice, "af_heart")
+        desired = _VOICE_MAP.get(voice, voice)
+        if desired in spk2id:
+            speaker_id = spk2id[desired]
+        elif spk2id:
+            # Best-effort fallback to first available speaker
+            speaker_id = next(iter(spk2id.values()))
+        else:
+            # Some MeloTTS builds don't expose spk2id for single-speaker EN.
+            # Use canonical default speaker id.
+            speaker_id = 0
 
-        chunks = []
-        for _, _, audio_chunk in self._model(
-            text,
-            voice=kokoro_voice,
-            speed=prosody.rate_multiplier,
-            split_pattern=r"\n+",
-        ):
-            if audio_chunk is not None:
-                chunks.append(audio_chunk)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            out_path = tmp.name
 
-        if not chunks:
-            return np.zeros(self._sample_rate, dtype=np.float32)
+        try:
+            self._model.tts_to_file(
+                text=text,
+                speaker_id=speaker_id,
+                output_path=out_path,
+                speed=prosody.rate_multiplier,
+            )
 
-        audio = np.concatenate(chunks).astype(np.float32)
+            if _SF_AVAILABLE:
+                audio, sr = sf.read(out_path, dtype="float32")
+            else:
+                with wave.open(out_path, "rb") as wf:
+                    sr = wf.getframerate()
+                    frames = wf.readframes(wf.getnframes())
+                    audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32767.0
+
+            if isinstance(audio, np.ndarray) and audio.ndim > 1:
+                audio = audio.mean(axis=1)
+
+            if int(sr) != self._sample_rate and _LIBROSA_AVAILABLE:
+                audio = librosa.resample(audio, orig_sr=int(sr), target_sr=self._sample_rate)
+        finally:
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+
+        audio = np.asarray(audio, dtype=np.float32).squeeze()
         peak = np.abs(audio).max()
         if peak > 0:
             audio = audio / peak

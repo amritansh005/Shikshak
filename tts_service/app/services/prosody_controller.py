@@ -1,11 +1,11 @@
 """
-Prosody controller for Qwen3-TTS.
+Prosody controller for OpenVoice-lite TTS.
 
 Maps TeachingDirective emotion signals (smoothed_state, trend, teaching_state,
 secondary_state, negative_pressure) into:
 
   1. Voice parameters  — speaking rate, pitch shift, energy level
-  2. Qwen3-TTS style prompt  — natural language instruction injected as a
+  2. Style prompt  — natural language emotional speaking guidance
      system-level speaking style hint
   3. SSML-style prosody hints  — injected around text for models that support
      <prosody> tags (gracefully skipped for models that do not)
@@ -133,10 +133,9 @@ _TREND_ENERGY_DELTA: Dict[str, float] = {
 }
 
 
-# ── Style prompts (natural language speaking style for Qwen3-TTS) ─────────────
+# ── Style prompts (natural language speaking style guidance) ───────────────────
 #
-# These are injected into the TTS system prompt as speaking style instructions.
-# Qwen3-TTS / Qwen2.5-Omni supports a <|STYLE|> or system-prompt style hint.
+# These are retained as backend-agnostic emotional speaking instructions.
 # Keep them short and imperative.
 
 _STATE_STYLE_PROMPTS: Dict[str, str] = {
@@ -208,7 +207,7 @@ class ResolvedProsody:
     energy_level: float = 0.70
     pause_after_sentence_ms: int = 200
 
-    # Natural language speaking style for Qwen3-TTS system prompt
+    # Natural language emotional speaking guidance
     style_prompt: str = "Speak clearly and naturally with a warm, friendly teaching tone."
 
     # Emotion context (informational — logged, not sent to model)

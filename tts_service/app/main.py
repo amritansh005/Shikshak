@@ -147,8 +147,8 @@ class VoiceInfo(BaseModel):
 
 # ── Available voices ──────────────────────────────────────────────────────────
 _VOICES = [
-    VoiceInfo(id="default", name="Default", gender="female", language="en",
-              description="Chatterbox built-in voice — expressive, clear"),
+    VoiceInfo(id="default", name="Default", gender="neutral", language="en",
+              description="OpenVoice-lite default voice — clear and lightweight"),
 ]
 
 

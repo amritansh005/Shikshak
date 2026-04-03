@@ -11,7 +11,7 @@ load_dotenv()
 @dataclass(frozen=True)
 class Settings:
     # ── Model ────────────────────────────────────────────────────────
-    tts_model: str = os.getenv("TTS_MODEL", "chatterbox")
+    tts_model: str = os.getenv("TTS_MODEL", "openvoice")
     tts_device: str = os.getenv("TTS_DEVICE", "cuda")       # cuda | cpu
     tts_dtype: str = os.getenv("TTS_DTYPE", "bfloat16")       # float16 | float32 | bfloat16
 

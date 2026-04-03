@@ -29,8 +29,14 @@ class EmbeddingService:
             return []
 
         try:
-            response = self.llm.bg_client.embeddings(model=self.model, prompt=clean_text)
-            embedding = response.get("embedding", [])
+            # Force CPU-only for embeddings (num_gpu=0) so the embedding
+            # model doesn't evict Gemma from GPU VRAM.
+            response = self.llm.bg_client.embed(
+                model=self.model,
+                input=clean_text,
+                options={"num_gpu": 0},
+            )
+            embedding = response.get("embeddings", [[]])[0]
             if not isinstance(embedding, list):
                 return []
             return [float(x) for x in embedding]

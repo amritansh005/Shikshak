@@ -17,15 +17,20 @@ Microphone → STT (port 9001)
 ## 1. Start the TTS service
 
 ```bash
+conda activate shikshak_tts
 cd tts_service
 cp .env.example .env        # edit model path / device as needed
 pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 5000 --workers 1
 ```
 
-> **GPU note:** Qwen2.5-Omni requires ~16 GB VRAM (float16).
-> On CPU-only machines, the service auto-falls back to **Kokoro-82M** (`pip install kokoro`)
-> which needs ~500 MB RAM and produces decent quality at lower latency.
+> **Backend note:** This setup uses **OpenVoice-lite (MeloTTS runtime)** by default.
+> It is significantly lighter than large conversational TTS stacks and works on
+> both GPU and CPU (GPU recommended for lower latency).
+>
+> If startup logs show `No module named 'melo'`, you're likely running uvicorn
+> from a different Python environment. Re-activate the same env where `pip install`
+> was executed and restart the service.
 
 ---
 
