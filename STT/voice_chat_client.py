@@ -262,6 +262,7 @@ class InterruptionState:
         self.frames_seen: int = 0
         self.partial_confirm_in_flight: bool = False
         self.vad_asr_delegated: bool = False
+        self.candidate_id: int = 0
 
     def reset(self) -> None:
         self.active = False
@@ -275,6 +276,7 @@ class InterruptionState:
         self.frames_seen = 0
         self.partial_confirm_in_flight = False
         self.vad_asr_delegated = False
+        # NOTE: candidate_id intentionally NOT reset — it only increments
 
     def begin_candidate(self, tts_text: str) -> None:
         self.active = True
@@ -288,6 +290,7 @@ class InterruptionState:
         self.frames_seen = 0
         self.partial_confirm_in_flight = False
         self.vad_asr_delegated = False
+        self.candidate_id += 1
 
 
 class LiveTranscriptState:
@@ -426,6 +429,7 @@ def _run_partial_interrupt_confirmation(
         audio_bytes = state.turn.snapshot_audio()
         generation = state.turn_generation
         tts_text_snapshot = state.interruption.tts_text_snapshot
+        candidate_id = state.interruption.candidate_id
         state.interruption.partial_confirm_in_flight = True
 
     def worker() -> None:
@@ -456,9 +460,18 @@ def _run_partial_interrupt_confirmation(
             with state.lock:
                 if generation != state.turn_generation:
                     return
-                if not state.interruption.active or state.interruption.confirmed:
+                if state.interruption.confirmed:
+                    return
+                # If a NEW interruption candidate started after the silence
+                # reset cleared ours, don't confirm with stale audio.
+                if state.interruption.candidate_id != candidate_id:
                     return
 
+                # Re-activate interruption if it was reset by the silence
+                # timer while we were transcribing.  The generation and
+                # candidate_id checks guarantee this audio belongs to the
+                # correct interruption attempt.
+                state.interruption.active = True
                 state.interruption.confirmed = True
                 state.interruption.reason = reason
                 state.interruption_meta_for_turn = {
@@ -916,12 +929,37 @@ def finalize_turn(
                     sentence_queue.put(_SENTINEL)
 
             # ── Sentence iterator: reads from queue until sentinel ──
-            def _sentence_iter():
-                while True:
-                    sentence = sentence_queue.get()
-                    if sentence is _SENTINEL:
-                        return
-                    yield sentence
+            # Uses a timeout on get() so that when stream_and_play tries to
+            # drain remaining sentences after an interruption, it won't block
+            # indefinitely if the LLM producer is still running.
+            _iter_drain_mode = False  # set True by stream_and_play drain
+
+            class _DrainableSentenceIter:
+                """Wrapper around a queue-backed generator that supports
+                a drain mode with short timeouts for non-blocking drain."""
+
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    while True:
+                        try:
+                            timeout = 0.3 if _iter_drain_mode else 30
+                            item = sentence_queue.get(timeout=timeout)
+                        except _queue.Empty:
+                            if _iter_drain_mode:
+                                raise StopIteration
+                            continue
+                        if item is _SENTINEL:
+                            raise StopIteration
+                        return item
+
+                @staticmethod
+                def _enable_drain_mode():
+                    nonlocal _iter_drain_mode
+                    _iter_drain_mode = True
+
+            sentence_iter = _DrainableSentenceIter()
 
             # Start LLM producer on a sub-thread
             producer = threading.Thread(target=_llm_producer, daemon=True, name="llm-producer")
@@ -930,7 +968,7 @@ def finalize_turn(
             # Play TTS sentence-by-sentence (blocks until all done or interrupted)
             if _tts_client is not None:
                 _tts_client.stream_and_play(
-                    sentences=_sentence_iter(),
+                    sentences=sentence_iter,
                     emotion_payload=_ed,
                     session_id=_sid,
                 )

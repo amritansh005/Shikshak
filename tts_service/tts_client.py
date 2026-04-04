@@ -145,23 +145,65 @@ class TTSClient:
             self._interrupted_emotion = None
             self._interrupted_session = None
             self._interrupted_full_text = ""
+            # Ensure volume is restored (belt-and-suspenders — duck may
+            # have reduced it and the restore path may not have run)
+            self._volume_scale = 1.0
 
         if remaining_audio is not None:
-            # We have leftover audio bytes from mid-chunk — play them
-            logger.info("TTS resuming playback from interrupted audio")
+            # Estimate remaining audio duration for logging
+            audio_duration_ms = 0.0
+            try:
+                buf = io.BytesIO(remaining_audio)
+                with wave.open(buf, "rb") as wf:
+                    n_frames = wf.getnframes()
+                    sample_rate = wf.getframerate()
+                    if sample_rate > 0:
+                        audio_duration_ms = (n_frames / sample_rate) * 1000.0
+            except Exception:
+                pass
+
+            logger.info(
+                "TTS resuming playback from interrupted audio | duration=%.0fms | remaining_chunks=%d",
+                audio_duration_ms,
+                len(remaining_chunks) if remaining_chunks else 0,
+            )
+
+            # If remaining audio is trivially short (<150ms), skip it and
+            # go straight to re-synthesizing remaining chunks if any.
+            if audio_duration_ms < 150.0 and not remaining_chunks:
+                logger.info(
+                    "TTS resume skipped — remaining audio too short (%.0fms) and no chunks to play",
+                    audio_duration_ms,
+                )
+                return
+
             self._set_playback_state(True, full_text)
             try:
-                self._play_wav_bytes_streaming(remaining_audio)
-            finally:
+                if audio_duration_ms >= 150.0:
+                    self._play_wav_bytes_streaming(remaining_audio)
                 # If there are also remaining chunks, continue with those
                 if remaining_chunks:
+                    # Check if playback was re-interrupted during the audio resume
+                    with self._state_lock:
+                        if self._stop_event.is_set():
+                            # Save chunks back for another potential resume
+                            self._interrupted_chunks = remaining_chunks
+                            self._interrupted_emotion = emotion
+                            self._interrupted_session = session_id
+                            self._interrupted_full_text = full_text
+                            logger.info("TTS resume re-interrupted before remaining chunks")
+                            return
                     self._play_remaining_chunks(
                         remaining_chunks, emotion, session_id, full_text
                     )
+            finally:
                 self._set_playback_state(False, "")
         elif remaining_chunks:
             # Interrupted between chunks — play remaining chunks
-            logger.info("TTS resuming playback from remaining chunks")
+            logger.info(
+                "TTS resuming playback from remaining chunks | chunks=%d",
+                len(remaining_chunks),
+            )
             self._play_remaining_chunks(
                 remaining_chunks, emotion, session_id, full_text
             )
@@ -476,6 +518,34 @@ class TTSClient:
         except Exception as exc:
             logger.debug("pyttsx3 fallback failed | %s", exc)
 
+    @staticmethod
+    def _drain_remaining_sentences(sentences_iter, max_wait_s: float = 1.0) -> list:
+        """Non-blocking drain of remaining sentences from an iterator.
+
+        The iterator may be backed by a queue that blocks while the LLM is
+        still producing.  We signal drain mode (if supported) so the
+        iterator uses a short timeout, and also enforce an overall deadline.
+        """
+        # Signal the iterator to use short timeouts (non-blocking drain)
+        enable_drain = getattr(sentences_iter, "_enable_drain_mode", None)
+        if callable(enable_drain):
+            enable_drain()
+
+        remaining: list = []
+        deadline = time.monotonic() + max_wait_s
+        try:
+            for s in sentences_iter:
+                if s and s.strip():
+                    remaining.append(s)
+                if time.monotonic() > deadline:
+                    logger.debug(
+                        "Drain deadline reached — collected %d sentences", len(remaining)
+                    )
+                    break
+        except Exception:
+            pass
+        return remaining
+
     def stream_and_play(
         self,
         sentences,
@@ -505,6 +575,8 @@ class TTSClient:
         self.clear_resume_state()
         playback_entered = False
         sentence_count = 0
+        # Collect the full text as we go so resume context is accurate
+        accumulated_text = ""
 
         try:
             for sentence in sentences:
@@ -512,14 +584,26 @@ class TTSClient:
                     continue
 
                 sentence_count += 1
+                accumulated_text = (accumulated_text + " " + sentence).strip() if accumulated_text else sentence
 
                 # Check _stop_event between sentences
                 if playback_entered:
                     with self._state_lock:
                         if self._stop_event.is_set():
+                            # Drain remaining sentences from iterator for resume.
+                            # Use a short timeout per item to avoid blocking if the
+                            # iterator is backed by a queue still waiting on an LLM.
+                            remaining = self._drain_remaining_sentences(sentences)
+                            # The current sentence wasn't played yet — include it
+                            remaining.insert(0, sentence)
+                            if remaining:
+                                self._interrupted_chunks = remaining
+                                self._interrupted_emotion = emotion_payload
+                                self._interrupted_session = session_id
+                                self._interrupted_full_text = accumulated_text
                             logger.info(
-                                "TTS stream aborted by interruption | played %d sentences",
-                                sentence_count - 1,
+                                "TTS stream aborted by interruption | played %d sentences | saved %d for resume",
+                                sentence_count - 1, len(remaining),
                             )
                             break
 
@@ -548,14 +632,31 @@ class TTSClient:
                     )
 
                     if not playback_entered:
-                        self._set_playback_state(True, sentence)
+                        self._set_playback_state(True, accumulated_text)
+                        # Save context for resume in case of mid-chunk interruption
+                        with self._state_lock:
+                            self._interrupted_full_text = accumulated_text
+                            self._interrupted_emotion = emotion_payload
+                            self._interrupted_session = session_id
                         playback_entered = True
 
                     self._play_wav_bytes_streaming(resp.content)
 
-                    # Check if interrupted during playback
+                    # Check if interrupted during playback of this chunk
                     with self._state_lock:
                         if self._stop_event.is_set():
+                            # _play_wav_bytes_streaming already saved _interrupted_audio.
+                            # Now drain and save remaining sentences from iterator.
+                            remaining = self._drain_remaining_sentences(sentences)
+                            if remaining:
+                                self._interrupted_chunks = remaining
+                                self._interrupted_emotion = emotion_payload
+                                self._interrupted_session = session_id
+                                self._interrupted_full_text = accumulated_text
+                            logger.info(
+                                "TTS stream mid-chunk interruption | played %d sentences | saved %d chunks for resume",
+                                sentence_count, len(remaining),
+                            )
                             break
 
                     self._available = True

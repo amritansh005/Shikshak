@@ -267,10 +267,33 @@ class LiveSessionWorker(QObject):
             # every frame.
             _interruption_listening_emitted = False
 
+            # Track TTS playback state to emit Speaking/Listening
+            # transitions directly from the event loop. This is more
+            # reliable than PrintCapture which exits before bg-stream-tts
+            # finishes.
+            _last_tts_playing = False
+
             try:
                 for event in streamer.stream_events():
                     if self._stop_requested:
                         break
+
+                    # ── TTS state tracking ──
+                    # Check every frame whether TTS started/stopped and
+                    # update the GUI status accordingly.
+                    _tts_now = vcc._tts_is_playing()
+                    if _tts_now and not _last_tts_playing:
+                        # TTS just started playing
+                        self.status_changed.emit("Speaking")
+                    elif not _tts_now and _last_tts_playing:
+                        # TTS just stopped — revert to Listening unless
+                        # an interruption is being processed
+                        with state.lock:
+                            is_finalizing = state.finalizing
+                            is_interrupted = state.interruption.confirmed
+                        if not is_finalizing and not is_interrupted:
+                            self.status_changed.emit("Listening")
+                    _last_tts_playing = _tts_now
 
                     # finalize_turn (bg thread) cannot safely call
                     # streamer.reset() — do it here on the main thread.
