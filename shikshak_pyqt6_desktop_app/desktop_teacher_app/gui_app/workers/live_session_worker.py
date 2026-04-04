@@ -109,6 +109,13 @@ class PrintCapture:
                 self.worker.final_student_text.emit(student_text)
                 self.worker.live_student_text.emit("")
 
+        elif text.startswith("Teacher+ "):
+            streamed_text = text[9:].strip()
+            if streamed_text:
+                self.worker.live_teacher_text.emit(streamed_text)
+                self.worker.status_changed.emit("Speaking")
+                self.saw_teacher_reply = True
+
         elif text.startswith("Teacher: "):
             teacher_text = text[9:].strip()
             if teacher_text:

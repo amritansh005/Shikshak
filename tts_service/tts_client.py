@@ -476,6 +476,101 @@ class TTSClient:
         except Exception as exc:
             logger.debug("pyttsx3 fallback failed | %s", exc)
 
+    def stream_and_play(
+        self,
+        sentences,
+        emotion_payload: Optional[Dict] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Synthesize and play sentences from an iterator, one at a time.
+
+        This is the streaming counterpart of _synthesize_and_play().
+        Instead of splitting pre-existing text into chunks, it reads
+        sentences from an iterator (typically fed by an LLM stream)
+        and plays each one immediately.
+
+        Same playback state management as _synthesize_and_play:
+        - _set_playback_state(True) on first sentence
+        - _stop_event checked between sentences and per audio chunk
+        - _set_playback_state(False) in finally block
+
+        Designed to run on a background thread (called from
+        voice_chat_client's _bg_stream_tts_and_memory thread).
+        """
+        if not self.is_available():
+            self.invalidate_availability_cache()
+            if not self.is_available():
+                return
+
+        self.clear_resume_state()
+        playback_entered = False
+        sentence_count = 0
+
+        try:
+            for sentence in sentences:
+                if not sentence or not sentence.strip():
+                    continue
+
+                sentence_count += 1
+
+                # Check _stop_event between sentences
+                if playback_entered:
+                    with self._state_lock:
+                        if self._stop_event.is_set():
+                            logger.info(
+                                "TTS stream aborted by interruption | played %d sentences",
+                                sentence_count - 1,
+                            )
+                            break
+
+                try:
+                    payload: Dict = {"text": sentence, "use_cache": True}
+                    if self._voice:
+                        payload["voice"] = self._voice
+                    if emotion_payload:
+                        payload["emotion"] = emotion_payload
+                    if session_id:
+                        payload["session_id"] = session_id
+
+                    resp = requests.post(
+                        f"{self._url}/synthesize",
+                        json=payload,
+                        timeout=self._timeout,
+                    )
+                    resp.raise_for_status()
+
+                    latency = resp.headers.get("X-TTS-Latency-Ms", "?")
+                    state_hdr = resp.headers.get("X-TTS-Resolved-State", "?")
+                    cache_hit = resp.headers.get("X-TTS-Cache-Hit", "false") == "true"
+                    logger.info(
+                        "TTS stream | sentence=%d | latency=%sms | state=%s | cache=%s | chars=%d",
+                        sentence_count, latency, state_hdr, cache_hit, len(sentence),
+                    )
+
+                    if not playback_entered:
+                        self._set_playback_state(True, sentence)
+                        playback_entered = True
+
+                    self._play_wav_bytes_streaming(resp.content)
+
+                    # Check if interrupted during playback
+                    with self._state_lock:
+                        if self._stop_event.is_set():
+                            break
+
+                    self._available = True
+
+                except requests.exceptions.ConnectionError:
+                    logger.warning("TTSClient stream | service unreachable")
+                    self._available = False
+                    break
+                except Exception as exc:
+                    logger.warning("TTSClient stream sentence %d error | %s", sentence_count, exc)
+                    break
+        finally:
+            if playback_entered:
+                self._set_playback_state(False, "")
+
     def _play_wav_bytes_streaming(self, wav_bytes: bytes) -> None:
         if not _SD_AVAILABLE:
             logger.debug("sounddevice not available — audio not played")

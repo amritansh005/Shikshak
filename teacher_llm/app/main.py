@@ -1,10 +1,12 @@
 import logging
+import json as _json
 import re
 import threading
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.services.chat_memory import ChatMemoryService
@@ -403,6 +405,107 @@ def chat(req: ChatRequest) -> ChatResponse:
     # ─────────────────────────────────────────────────────────────
 
     return ChatResponse(response=full_response, directive=directive_dict)
+
+
+# ─────────────────────────────────────────────────────────────────
+# STREAMING CHAT — sentence-by-sentence for pipelined TTS
+# ─────────────────────────────────────────────────────────────────
+
+_SENTENCE_BOUNDARY_RE = re.compile(r'(?<=[.!?])\s+')
+
+
+def _stream_chat_generator(req: ChatRequest):
+    user_input = req.message.strip()
+    session_id = req.session_id.strip()
+
+    if not user_input:
+        yield _json.dumps({"done": True, "full_text": "", "directive": None}) + "\n"
+        return
+
+    logger.info("New student message received (stream) | session_id=%s | text=%r", session_id, user_input)
+
+    _llm.cancel_memory_card_extraction()
+
+    conversation_summary = _memory.get_conversation_summary_for_prompt(session_id)
+    history_messages = _memory.get_recent_history_for_prompt(session_id)
+    llm_user_message = user_input
+
+    recall_decision = _recall_service.get_recall_decision_for_turn(
+        user_message=llm_user_message, history_messages=history_messages,
+        conversation_summary=conversation_summary,
+    )
+
+    recalled_memory = None
+    recall_clarification_mode = False
+    recall_clarification_question = ""
+    fresh_teach_topic = ""
+    explicit_recall_cue_present = _has_explicit_recall_cue(llm_user_message)
+
+    if recall_decision.recall_needed and explicit_recall_cue_present:
+        if recall_decision.needs_recall_clarification or not recall_decision.topic_clear_for_recall:
+            recall_clarification_mode = True
+            recall_clarification_question = (recall_decision.clarification_question or "").strip()
+            fresh_teach_topic = (recall_decision.fresh_teach_topic or recall_decision.likely_topic or "").strip()
+        else:
+            recalled_memory = _recall_service.get_recalled_memory_for_turn(
+                session_id=session_id, user_message=llm_user_message,
+                history_messages=history_messages, conversation_summary=conversation_summary,
+            )
+
+    emotion_instruction = ""
+    directive_dict = None
+    if req.emotion:
+        directive = _emotion_state.record_turn(session_id, req.emotion)
+        emotion_instruction = directive.instruction or ""
+        directive_dict = {
+            "smoothed_state": directive.smoothed_state,
+            "smoothed_confidence": directive.smoothed_confidence,
+            "trend": directive.trend,
+            "secondary_state": directive.smoothed_secondary_state,
+            "secondary_confidence": directive.smoothed_secondary_confidence,
+            "raw_text_label": directive.raw_text_label,
+            "raw_audio_label": directive.raw_audio_label,
+        }
+
+    buffer = ""
+    full_parts = []
+
+    for token in _llm.stream_generate(
+        user_message=llm_user_message, history_messages=history_messages,
+        conversation_summary=conversation_summary, recalled_memory=recalled_memory,
+        recall_clarification_mode=recall_clarification_mode,
+        recall_clarification_question=recall_clarification_question,
+        fresh_teach_topic=fresh_teach_topic, emotion_instruction=emotion_instruction,
+    ):
+        buffer += token
+        full_parts.append(token)
+        while True:
+            match = _SENTENCE_BOUNDARY_RE.search(buffer)
+            if not match:
+                break
+            sentence = buffer[:match.start()].strip()
+            buffer = buffer[match.end():]
+            if sentence:
+                sanitized = _sanitize_for_tts(sentence)
+                if sanitized:
+                    yield _json.dumps({"sentence": sanitized}) + "\n"
+
+    if buffer.strip():
+        sanitized = _sanitize_for_tts(buffer.strip())
+        if sanitized:
+            yield _json.dumps({"sentence": sanitized}) + "\n"
+
+    full_response = _sanitize_for_tts("".join(full_parts).strip())
+    _memory.save_message(session_id=session_id, role="user", content=user_input)
+    _memory.save_message(session_id=session_id, role="assistant", content=full_response)
+    logger.info("Current turn messages saved (stream) | response_chars=%s", len(full_response))
+
+    yield _json.dumps({"done": True, "full_text": full_response, "directive": directive_dict}) + "\n"
+
+
+@app.post("/chat_stream")
+def chat_stream(req: ChatRequest):
+    return StreamingResponse(_stream_chat_generator(req), media_type="application/x-ndjson")
 
 
 class MemoryCardRequest(BaseModel):

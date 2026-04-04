@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins as _builtins_module
+import json as _json
 import logging
 import os
 import sys
@@ -412,8 +413,10 @@ def _run_partial_interrupt_confirmation(
     partial_asr_threshold_ms: float,
 ) -> None:
     with state.lock:
-        if not state.interruption.active or state.interruption.confirmed or state.finalizing:
+        if not state.interruption.active or state.interruption.confirmed:
             return
+        # NOTE: state.finalizing is NOT checked — the user must be able
+        # to interrupt TTS running on the bg thread inside finalize_turn.
         if state.interruption.partial_confirm_in_flight:
             return
         candidate_ms = state.interruption.candidate_speech_ms
@@ -465,17 +468,10 @@ def _run_partial_interrupt_confirmation(
                     "speech_ms_before_cancel": round(state.interruption.candidate_speech_ms, 1),
                 }
 
-                # Save the prefix text so it survives state resets.
-                # If the current turn gets discarded (too short, hallucination)
-                # and the user continues speaking into a new turn, this prefix
-                # will be prepended to that next turn's transcription.
-                _prefix = ""
-                if reason.startswith("partial_asr:"):
-                    _prefix = reason[len("partial_asr:"):].strip().rstrip(".-,!?")
-                elif reason.startswith("keyword:"):
-                    _prefix = reason[len("keyword:"):].strip().rstrip(".-,!?")
-                if _prefix:
-                    state.pending_interruption_prefix = _prefix
+                # NOTE: We do NOT save pending_interruption_prefix.
+                # During TTS the mic picks up speaker audio, so partial
+                # ASR text is contaminated.  The user's speech will be
+                # captured cleanly as a new turn after TTS stops.
 
             logger.info("Interruption confirmed via partial ASR | reason=%s", reason)
             _tts_stop_playback()
@@ -507,20 +503,21 @@ def maybe_handle_tts_interruption(
         _tts_restore_playback()
         return
 
-    # ── Re-check speech via VAD during TTS playback ──
+    # ── Use raw VAD speech flag during TTS playback ──
+    # Do NOT re-check through noise_gate — it hears TTS audio from
+    # speakers and can falsely suppress real user speech.
     effective_is_speech = event.is_speech
-    if noise_gate is not None and event.is_speech and event.pcm_bytes:
-        try:
-            gate_says_speech = noise_gate.is_speech(event.pcm_bytes)
-            if not gate_says_speech:
-                effective_is_speech = False
-        except Exception:
-            pass
 
     # ── Feature #1: no-barge-in phase ──
-    playback_age = _tts_playback_age_ms()
-    if playback_age > 0 and playback_age < NO_BARGE_IN_MS:
-        return
+    # Only for NEW interruption candidates. Once the user started
+    # speaking, don't block frames with no-barge-in.
+    with state.lock:
+        candidate_already_active = state.interruption.active
+
+    if not candidate_already_active:
+        playback_age = _tts_playback_age_ms()
+        if playback_age > 0 and playback_age < NO_BARGE_IN_MS:
+            return
 
     # ── Feature #3: pick thresholds based on whether TTS is active ──
     tts_active = True
@@ -717,91 +714,12 @@ def finalize_turn(
                 "speech_ms_before_cancel": round(final_duration * 1000.0, 1),
             }
 
-        # ── Prepend partial ASR text from interruption confirmation ────
-        # Two sources of prefix text:
-        #   1. interruption_meta from THIS turn (normal case — interruption
-        #      confirmed and finalized in the same turn).
-        #   2. pending_interruption_prefix from a PREVIOUS turn (the
-        #      interruption was confirmed, the turn got reset, and the
-        #      user's remaining speech became a new turn).
-        _prefix_text = ""
-        if interruption_meta and interruption_meta.get("reason", ""):
-            _ireason = interruption_meta["reason"]
-            if _ireason.startswith("partial_asr:"):
-                _prefix_text = _ireason[len("partial_asr:"):].strip().rstrip(".-,!?")
-            elif _ireason.startswith("keyword:"):
-                _prefix_text = _ireason[len("keyword:"):].strip().rstrip(".-,!?")
-
-        # Fall back to pending prefix from a previous turn's interruption
-        if not _prefix_text:
-            with state.lock:
-                _prefix_text = state.pending_interruption_prefix
-
-        if _prefix_text:
-            # Only prepend if the final text doesn't already contain
-            # the same words (avoid duplication when ASR captured
-            # overlapping audio).
-            import re as _re
-
-            def _normalise_words(text: str) -> list[str]:
-                """Lowercase, strip punctuation, expand common contractions."""
-                _CONTRACTIONS = {
-                    "i'm": "i am", "don't": "do not", "can't": "cannot",
-                    "won't": "will not", "it's": "it is", "that's": "that is",
-                    "let's": "let us", "we're": "we are", "they're": "they are",
-                    "you're": "you are", "i've": "i have", "we've": "we have",
-                    "they've": "they have", "i'll": "i will", "we'll": "we will",
-                    "isn't": "is not", "aren't": "are not", "wasn't": "was not",
-                    "weren't": "were not", "didn't": "did not", "doesn't": "does not",
-                    "couldn't": "could not", "shouldn't": "should not",
-                    "wouldn't": "would not", "hasn't": "has not", "haven't": "have not",
-                }
-                words = []
-                for w in text.lower().split():
-                    w_clean = _re.sub(r"[^\w']", "", w)  # keep apostrophes for contractions
-                    expanded = _CONTRACTIONS.get(w_clean, w_clean)
-                    words.extend(expanded.split())
-                return [w for w in words if w]  # drop empties
-
-            prefix_norm = _normalise_words(_prefix_text)
-            final_norm = _normalise_words(final_text)
-
-            # Check 1: final text starts with prefix (original check)
-            already_present = (
-                len(prefix_norm) > 0
-                and len(final_norm) >= len(prefix_norm)
-                and final_norm[:len(prefix_norm)] == prefix_norm
-            )
-
-            # Check 2: prefix appears as a contiguous subsequence anywhere
-            # in the final text (handles leading filler words like "um", "so")
-            if not already_present and len(prefix_norm) > 0:
-                plen = len(prefix_norm)
-                for i in range(len(final_norm) - plen + 1):
-                    if final_norm[i:i + plen] == prefix_norm:
-                        already_present = True
-                        break
-
-            # Check 3: high word-overlap ratio (handles minor ASR rewording)
-            if not already_present and len(prefix_norm) >= 3:
-                prefix_set = set(prefix_norm)
-                final_set = set(final_norm)
-                overlap = len(prefix_set & final_set)
-                ratio = overlap / len(prefix_set) if prefix_set else 0.0
-                if ratio >= 0.8:
-                    already_present = True
-
-            if not already_present and _prefix_text:
-                combined = f"{_prefix_text} {final_text}"
-                logger.info(
-                    "Prepended interruption partial ASR | prefix=%r | final=%r | combined=%r",
-                    _prefix_text, final_text, combined,
-                )
-                final_text = combined
-
-        # Clear the pending prefix — it's been consumed (or wasn't needed)
-        with state.lock:
-            state.pending_interruption_prefix = ""
+        # NOTE: The old code prepended partial ASR text from the
+        # interruption confirmation here.  This has been removed because
+        # during TTS playback the mic picks up the speaker audio, making
+        # the partial ASR text contaminated (e.g. "and practice" from the
+        # teacher's speech).  The user's post-interruption speech is
+        # captured cleanly as a new turn — no prepending needed.
 
         word_count = len(final_text.split())
         speech_frames = sum(1 for f in is_speech_snapshot if f)
@@ -923,41 +841,117 @@ def finalize_turn(
             )
         print()
 
-        result = send_to_teacher(
-            session_id=session_id,
-            text=final_text,
-            emotion_data=emotion_data,
-            interruption_meta=interruption_meta,
-        )
-        teacher_text = result["text"]
-        teacher_directive = result["directive"]
+        # ── Stream LLM + TTS on background thread ────────────────────
+        # Fire everything (LLM streaming + per-sentence TTS + memory
+        # card) on a daemon thread. finalize_turn returns immediately,
+        # the finally block resets the streamer BEFORE TTS starts.
+        # This means any user interruption during TTS is captured as
+        # a fresh clean turn — identical to the old code where
+        # speak_with_emotion() enqueued and returned instantly.
+        #
+        # Architecture: a queue bridges LLM streaming and TTS playback.
+        # The LLM producer puts sentences into the queue as they arrive.
+        # stream_and_play reads from the queue and plays each sentence
+        # immediately — so TTS starts on sentence 1 while the LLM is
+        # still generating sentence 2.
 
-        print(f"Teacher: {teacher_text}\n", flush=True)
+        _sid = session_id
+        _ft = final_text
+        _ed = emotion_data
+        _im = interruption_meta
 
-        if _tts_client is not None and teacher_text:
-            if teacher_directive is not None:
-                _tts_client.speak_with_emotion(
-                    text=teacher_text,
-                    emotion_data=teacher_directive,
-                    session_id=session_id,
+        # Stop any currently-playing TTS from a previous turn's bg thread.
+        # This prevents overlapping audio when the user speaks multiple
+        # short turns in rapid succession.
+        _tts_stop_playback()
+
+        def _bg_stream_tts_and_memory():
+            import queue as _queue
+
+            stream_url = settings.teacher_chat_url.rsplit("/chat", 1)[0] + "/chat_stream"
+            payload: Dict[str, Any] = {"message": _ft, "session_id": _sid}
+            if _ed:
+                payload["emotion"] = _ed
+            if _im:
+                payload["interruption_meta"] = _im
+
+            teacher_text = ""
+            sentence_queue: _queue.Queue = _queue.Queue()
+            _SENTINEL = None  # signals "no more sentences"
+
+            # ── LLM producer: reads NDJSON stream, puts sentences in queue ──
+            def _llm_producer():
+                nonlocal teacher_text
+                try:
+                    resp = requests.post(stream_url, json=payload, timeout=180, stream=True)
+                    resp.raise_for_status()
+
+                    for raw_line in resp.iter_lines(decode_unicode=True):
+                        if not raw_line:
+                            continue
+                        try:
+                            msg = _json.loads(raw_line)
+                        except _json.JSONDecodeError:
+                            continue
+
+                        if msg.get("done"):
+                            teacher_text = msg.get("full_text", teacher_text)
+                            continue
+
+                        sentence = msg.get("sentence", "").strip()
+                        if sentence:
+                            accumulated = (teacher_text + " " + sentence).strip() if teacher_text else sentence
+                            print(f"Teacher+ {accumulated}", flush=True)
+                            teacher_text = accumulated
+                            sentence_queue.put(sentence)
+
+                    resp.close()
+                except Exception as exc:
+                    logger.warning("chat_stream failed, falling back to /chat | error=%s", exc)
+                    result = send_to_teacher(_sid, _ft, _ed, _im)
+                    teacher_text = result["text"]
+                    if teacher_text:
+                        sentence_queue.put(teacher_text)
+                finally:
+                    sentence_queue.put(_SENTINEL)
+
+            # ── Sentence iterator: reads from queue until sentinel ──
+            def _sentence_iter():
+                while True:
+                    sentence = sentence_queue.get()
+                    if sentence is _SENTINEL:
+                        return
+                    yield sentence
+
+            # Start LLM producer on a sub-thread
+            producer = threading.Thread(target=_llm_producer, daemon=True, name="llm-producer")
+            producer.start()
+
+            # Play TTS sentence-by-sentence (blocks until all done or interrupted)
+            if _tts_client is not None:
+                _tts_client.stream_and_play(
+                    sentences=_sentence_iter(),
+                    emotion_payload=_ed,
+                    session_id=_sid,
                 )
-            else:
-                _tts_client.speak_neutral(teacher_text, session_id=session_id)
 
-        # ── Trigger memory card extraction AFTER TTS finishes ────────
-        # Fire-and-forget: runs in a daemon thread so it doesn't block
-        # the finally cleanup.  The teacher server runs the actual
-        # extraction in its own background thread and returns immediately.
-        # This avoids GPU contention between Gemma (Ollama) and Kokoro
-        # (TTS) since both share the same CUDA device.
-        def _trigger_memory_card() -> None:
-            try:
-                _mc_url = settings.teacher_chat_url.rsplit("/chat", 1)[0] + "/extract_memory_card"
-                requests.post(_mc_url, json={"session_id": session_id}, timeout=10)
-            except Exception:
-                logger.debug("Memory card extraction trigger failed (non-critical)")
+            # Check if TTS was interrupted
+            tts_interrupted = _tts_client is not None and _tts_client._stop_event.is_set()
 
-        threading.Thread(target=_trigger_memory_card, daemon=True, name="mc-trigger").start()
+            # Wait for producer to finish cleanly (short timeout if interrupted)
+            producer.join(timeout=2 if tts_interrupted else 30)
+
+            print(f"Teacher: {teacher_text}\n", flush=True)
+
+            # ── Memory card after TTS (skip if interrupted) ──
+            if not tts_interrupted:
+                try:
+                    _mc_url = settings.teacher_chat_url.rsplit("/chat", 1)[0] + "/extract_memory_card"
+                    requests.post(_mc_url, json={"session_id": _sid}, timeout=10)
+                except Exception:
+                    logger.debug("Memory card extraction trigger failed (non-critical)")
+
+        threading.Thread(target=_bg_stream_tts_and_memory, daemon=True, name="bg-stream-tts").start()
 
     finally:
         if _resume_handled_cleanup:
